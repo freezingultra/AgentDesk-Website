@@ -1,0 +1,43 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AgentDesk</title><link rel="stylesheet" href="/web/style.css?v=32"></head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="brandmark">✦</div><div><b>AgentDesk</b><span>OpenAI-compatible agent</span></div></div>
+    <button class="new" id="newChat">＋ New Chat</button>
+    <div class="section"><span>WORKSPACE</span><span class="versionBadge">V34</span></div>
+    <nav>
+      <button class="nav active" data-view="chat">▣ <span>Chat</span></button>
+      <button class="nav" data-view="research">⌁ <span>Deep Research</span></button>
+      <button class="nav" data-view="search">⌕ <span>Web Search</span></button>
+      <button class="nav" data-view="memory">◈ <span>Memory</span></button>
+      <button class="nav" data-view="terminal">▤ <span>Terminal</span></button>
+      <button class="nav" data-view="settings">⚙ <span>Providers</span></button>
+    </nav>
+    <div class="section chatsHead"><span>CHATS</span><span id="folderLabel">General</span></div>
+    <div id="chatList" class="chatList"></div>
+    <div class="sidebarBottom"><div class="statusDot"></div><span>Local agent ready</span></div>
+  </aside>
+  <main class="main">
+    <header class="top"><div class="title" id="viewTitle">Chat</div></header>
+    <section id="chatView" class="view">
+      <div class="chatArea">
+        <div id="messages" class="messages">
+          <div class="welcome"><div class="orb">✦</div><h1>What are we building?</h1><p>Ask questions, write code, search the web, or use your saved memory.</p><div class="chips"><button data-fill="Research something on the web">Research something on the web</button><button data-fill="Write a Python script">Write a Python script</button><button data-fill="Explain an API with an example">Explain an API</button></div></div>
+        </div>
+        <aside id="chatSources" class="chatSources hidden"><div class="sourceRailHead"><span>Sources</span><span id="chatSourceCount">0</span></div><div id="chatSourceList" class="sourceRailList"></div></aside>
+      </div>
+      <div class="toolActivityDock"><div id="toolActivity" class="toolActivity hidden"></div></div>
+      <div class="composer"><div id="attachmentTray" class="attachmentTray"></div><div class="composerModelRow"><select id="provider" aria-label="Provider"></select><select id="modelSelect" aria-label="Model"></select></div><textarea id="prompt" rows="1" placeholder="Message AgentDesk…"></textarea><div class="composeBar"><div class="composeLeft"><label class="toggle"><input id="agentMode" type="checkbox" checked><span></span> Agent tools</label><label class="toggle"><input id="researchMode" type="checkbox"><span></span> Research</label><label class="toggle"><input id="terminalMode" type="checkbox"><span></span> Terminal</label><button class="toolLink" id="addFile">＋ File</button></div><span class="hint">Enter to send · Shift+Enter for newline</span><button id="send" title="Send">↑</button></div></div>
+    </section>
+    <section id="researchView" class="view hidden"><div class="researchLayout"><div class="panel researchCard"><div class="eyebrow">MULTI-STEP WEB RESEARCH</div><h2>Deep Research</h2><p class="muted">AgentDesk scales deep research passes to the selected model budget, reads selected page content, then synthesizes a report with traceable URLs.</p><div class="row"><input id="researchInput" placeholder="What should I research?"><button id="doResearch">Start Research</button></div><div id="researchStatus" class="statusBox">Ready.</div><div id="researchOutput" class="researchOutput"></div></div><aside class="panel sourcePanel"><div class="panelTitle"><h3>Sources</h3><span id="sourceCount">0</span></div><div id="researchSources" class="sources"></div></aside></div></section>
+    <section id="searchView" class="view hidden"><div class="panel searchPanel"><div class="eyebrow">PUBLIC WEB</div><h2>Web Search</h2><div class="row"><input id="searchInput" placeholder="Search the web"><button id="doSearch">Search</button></div><div id="searchResults"></div></div></section>
+    <section id="memoryView" class="view hidden"><div class="panel memoryPanel"><div class="eyebrow">PERSISTENT LOCAL CONTEXT</div><h2>Memory</h2><p class="muted">Stored locally across chats and updated by AgentDesk when durable context is worth remembering.</p><div class="memoryAdd"><input id="memInput" placeholder="e.g. I prefer TypeScript examples"><select id="memKind"><option>note</option><option>preference</option><option>project</option><option>fact</option></select><button id="addMem">Add</button></div><hr><div class="eyebrow">IMPORT FROM ANOTHER AI</div><p class="muted">Copy the export prompt into Claude or another provider that has your old memory. Paste its JSON response below, then import it here.</p><div class="actions"><button class="secondary" id="copyMemoryPrompt">Copy Memory Export Prompt</button></div><textarea id="memoryImportInput" class="memoryImport" placeholder="Paste the other AI's JSON memory export here…"></textarea><div class="actions"><button id="importMemory">Import Memory</button></div><div id="memoryImportStatus" class="settingsNote"></div><hr><div id="memList" class="memoryList"></div></div></section>
+    <section id="terminalView" class="view hidden"><div class="panel terminalPanel"><div class="eyebrow">LOCAL MACHINE</div><div class="terminalHead"><div><h2>Terminal</h2><p class="muted">Runs commands using the shell that matches this computer. AgentDesk launches it hidden in the background.</p></div><div id="terminalInfo" class="terminalBadge">Detecting…</div></div><div class="terminalRow"><input id="terminalCwd" placeholder="Working directory (optional)"><button class="secondary" id="terminalUseHome">Home</button></div><textarea id="terminalCommand" class="terminalCommand" spellcheck="false" placeholder="Type a command…"></textarea><div class="actions"><button id="runTerminal">Run Command</button><span class="muted terminalHint">Commands run locally on this computer.</span></div><pre id="terminalOutput" class="terminalConsole"></pre></div></section>
+    <section id="settingsView" class="view hidden"><div class="panel settingsPanel"><div class="eyebrow">MODEL CONNECTIONS</div><div class="panelTitle"><div><h2>Providers</h2><p class="muted">Add as many OpenAI-compatible providers as you want. AgentDesk tests the current provider in the background and lists only models the saved key can actually use when the provider supports access probing.</p></div><button id="newProvider">＋ Add Provider</button></div><div class="providerPicker"><label>Editing provider<select id="settingsProviderSelect"></select></label><span id="providerSaveState" class="settingsNote"></span></div><div class="grid"><label>Name<input id="pName"></label><label>Base URL<input id="pBase" placeholder="https://api.example.com/v1"></label><label>Default Model<input id="pModel" placeholder="Choose a discovered model or type one"></label><label>API Key<input id="pKey" type="password" placeholder="Enter API key"><small id="keyStatus" class="fieldHint">Saved keys stay on this computer.</small></label><label>MaxNewTok<input id="pMax" type="number" min="1" value="4096"></label><label>Discovered Models<input id="modelList" class="readonlyField" readonly placeholder="Background discovery will populate this"></label></div><div class="actions"><button id="saveProvider">Save Provider</button><button class="secondary" id="testProvider">Test Connection</button><button class="secondary" id="discoverModels">Refresh Models</button></div><div id="testResult" class="muted"></div><div id="providerCards" class="providerCards"></div><hr><div class="setupBox"><b>above.dev preset</b><span>https://api.above.dev/v1</span><span>glm-5.3-flash-modal</span></div></div></section>
+  </main>
+</div>
+<div id="runModal" class="modal hidden"><div class="modalCard"><div class="panelTitle"><h3>Run code</h3><button id="closeRun" class="x">×</button></div><select id="runLang"><option>python</option><option>javascript</option><option>go</option></select><textarea id="runCode" spellcheck="false"></textarea><div class="actions"><button id="executeCode">Run</button><button class="secondary" id="cancelRun">Cancel</button></div><pre id="runOutput" class="runOutput"></pre></div></div>
+<input id="fileInput" type="file" hidden multiple accept="image/*,.txt,.md,.markdown,.json,.csv,.html,.css,.js,.ts,.tsx,.jsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.xml,.yaml,.yml,.toml,.sql,.pdf,.xls,.xlsx">
+<script src="/web/app.js?v=35"></script>
+</body></html>
