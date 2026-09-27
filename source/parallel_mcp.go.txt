@@ -1,0 +1,311 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+const parallelSearchMCPURL = "https://search.parallel.ai/mcp"
+
+var parallelRPCID uint64 = 1
+
+type mcpEnvelope struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      any    `json:"id,omitempty"`
+	Result  any    `json:"result,omitempty"`
+	Error   any    `json:"error,omitempty"`
+}
+
+type mcpContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+	Data any    `json:"data,omitempty"`
+}
+
+type mcpResult struct {
+	Content    []mcpContentBlock `json:"content,omitempty"`
+	Structured any               `json:"structuredContent,omitempty"`
+	IsError    bool              `json:"isError,omitempty"`
+}
+
+func nextParallelRPCID() uint64 { return atomic.AddUint64(&parallelRPCID, 1) }
+
+func decodeMCPBody(resp *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/event-stream") || bytes.Contains(body, []byte("data:")) {
+		scanner := bufio.NewScanner(bytes.NewReader(body))
+		scanner.Buffer(make([]byte, 4096), 8<<20)
+		var last []byte
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "" || data == "[DONE]" {
+				continue
+			}
+			if json.Valid([]byte(data)) {
+				last = []byte(data)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+		if len(last) == 0 {
+			return nil, fmt.Errorf("Parallel MCP returned an empty event stream")
+		}
+		return last, nil
+	}
+	return body, nil
+}
+
+func parallelMCPRequest(method string, params any, session string) (mcpEnvelope, string, error) {
+	id := nextParallelRPCID()
+	payload := map[string]any{"jsonrpc": "2.0", "id": id, "method": method}
+	if params != nil {
+		payload["params"] = params
+	}
+	b, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", parallelSearchMCPURL, bytes.NewReader(b))
+	if err != nil {
+		return mcpEnvelope{}, session, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", "AgentDesk/21.0 ParallelSearchMCP")
+	req.Header.Set("MCP-Protocol-Version", "2025-03-26")
+	if session != "" {
+		req.Header.Set("Mcp-Session-Id", session)
+	}
+	resp, err := (&http.Client{Timeout: 45 * time.Second}).Do(req)
+	if err != nil {
+		return mcpEnvelope{}, session, fmt.Errorf("Parallel MCP network error: %w", err)
+	}
+	defer resp.Body.Close()
+	nextSession := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id"))
+	if nextSession != "" {
+		session = nextSession
+	}
+	data, err := decodeMCPBody(resp)
+	if err != nil {
+		return mcpEnvelope{}, session, err
+	}
+	if resp.StatusCode >= 400 {
+		return mcpEnvelope{}, session, fmt.Errorf("Parallel MCP HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var env mcpEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return mcpEnvelope{}, session, fmt.Errorf("Parallel MCP invalid JSON response: %w", err)
+	}
+	if env.Error != nil {
+		b, _ := json.Marshal(env.Error)
+		return env, session, fmt.Errorf("Parallel MCP error: %s", string(b))
+	}
+	return env, session, nil
+}
+
+func parallelInitialize() (string, error) {
+	env, session, err := parallelMCPRequest("initialize", map[string]any{
+		"protocolVersion": "2025-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "AgentDesk", "version": "15.0"},
+	}, "")
+	if err != nil {
+		return "", err
+	}
+	if env.Result == nil {
+		return "", fmt.Errorf("Parallel MCP initialize returned no result")
+	}
+	// Best-effort initialized notification. Some MCP servers accept a notification without a response.
+	if session != "" {
+		payload := map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{}}
+		b, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("POST", parallelSearchMCPURL, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("User-Agent", "AgentDesk/21.0 ParallelSearchMCP")
+		req.Header.Set("MCP-Protocol-Version", "2025-03-26")
+		req.Header.Set("Mcp-Session-Id", session)
+		resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		if err == nil {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+		}
+	}
+	return session, nil
+}
+
+func parallelMCPToolCall(tool string, arguments map[string]any) (mcpResult, error) {
+	session, err := parallelInitialize()
+	if err != nil {
+		return mcpResult{}, err
+	}
+	env, _, err := parallelMCPRequest("tools/call", map[string]any{"name": tool, "arguments": arguments}, session)
+	if err != nil {
+		return mcpResult{}, err
+	}
+	raw, _ := json.Marshal(env.Result)
+	var result mcpResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return result, fmt.Errorf("Parallel MCP tool result parse error: %w", err)
+	}
+	if result.IsError {
+		return result, fmt.Errorf("Parallel MCP tool %s returned an error", tool)
+	}
+	return result, nil
+}
+
+func mcpText(result mcpResult) string {
+	var parts []string
+	for _, c := range result.Content {
+		if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
+			parts = append(parts, c.Text)
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n")
+	}
+	if result.Structured != nil {
+		b, _ := json.Marshal(result.Structured)
+		return string(b)
+	}
+	return ""
+}
+
+func parallelSessionID() string { return fmt.Sprintf("agentdesk-%d", time.Now().UnixNano()) }
+
+func parallelSearchRaw(objective string, queries []string, modelName string) (string, error) {
+	args := map[string]any{
+		"objective":      strings.TrimSpace(objective),
+		"search_queries": queries,
+		"session_id":     parallelSessionID(),
+	}
+	if strings.TrimSpace(modelName) != "" {
+		args["model_name"] = strings.TrimSpace(modelName)
+	}
+	result, err := parallelMCPToolCall("web_search", args)
+	if err != nil {
+		return "", err
+	}
+	text := mcpText(result)
+	if text == "" {
+		return "", fmt.Errorf("Parallel Search MCP returned no text")
+	}
+	return text, nil
+}
+
+func parallelFetchRaw(urls []string, objective string, queries []string, fullContent bool, modelName string) (string, error) {
+	cleaned := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		raw = strings.TrimSpace(raw)
+		if u, err := url.Parse(raw); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+			cleaned = append(cleaned, raw)
+		}
+		if len(cleaned) >= 20 {
+			break
+		}
+	}
+	if len(cleaned) == 0 {
+		return "", fmt.Errorf("no valid URLs")
+	}
+	args := map[string]any{"urls": cleaned}
+	if strings.TrimSpace(objective) != "" {
+		args["objective"] = objective
+	}
+	if len(queries) > 0 {
+		args["search_queries"] = queries
+	}
+	args["full_content"] = fullContent
+	args["session_id"] = parallelSessionID()
+	if strings.TrimSpace(modelName) != "" {
+		args["model_name"] = modelName
+	}
+	result, err := parallelMCPToolCall("web_fetch", args)
+	if err != nil {
+		return "", err
+	}
+	text := mcpText(result)
+	if text == "" {
+		return "", fmt.Errorf("Parallel web_fetch returned no content")
+	}
+	return text, nil
+}
+
+func parseParallelMarkdownResults(text string) []map[string]string {
+	// Parallel MCP's text output is intentionally model-friendly. Normalize common Markdown link forms
+	// without depending on a brittle provider-specific JSON schema.
+	linkRe := regexp.MustCompile(`(?m)\[([^\]]+)\]\((https?://[^)]+)\)`)
+	matches := linkRe.FindAllStringSubmatch(text, 30)
+	out := make([]map[string]string, 0, len(matches))
+	seen := map[string]bool{}
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		u := strings.TrimSpace(m[2])
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		title := strings.TrimSpace(m[1])
+		out = append(out, map[string]string{"title": title, "url": u, "snippet": "", "content": ""})
+	}
+	if len(out) > 0 {
+		return out
+	}
+	// If structured JSON was serialized into text, recursively find url/title/content-ish objects.
+	var v any
+	if json.Unmarshal([]byte(text), &v) == nil {
+		collectParallelObjects(v, &out)
+	}
+	return out
+}
+
+func collectParallelObjects(v any, out *[]map[string]string) {
+	if len(*out) >= 20 {
+		return
+	}
+	switch x := v.(type) {
+	case []any:
+		for _, it := range x {
+			collectParallelObjects(it, out)
+		}
+	case map[string]any:
+		u, _ := x["url"].(string)
+		if u == "" {
+			u, _ = x["URL"].(string)
+		}
+		if u != "" && strings.HasPrefix(u, "http") {
+			title, _ := x["title"].(string)
+			if title == "" {
+				title, _ = x["name"].(string)
+			}
+			snippet, _ := x["snippet"].(string)
+			if snippet == "" {
+				snippet, _ = x["description"].(string)
+			}
+			content, _ := x["content"].(string)
+			if content == "" {
+				content, _ = x["excerpt"].(string)
+			}
+			*out = append(*out, map[string]string{"title": title, "url": u, "snippet": snippet, "content": content})
+		}
+		for _, it := range x {
+			collectParallelObjects(it, out)
+		}
+	}
+}
