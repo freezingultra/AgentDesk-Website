@@ -1,0 +1,3497 @@
+package main
+
+import (
+	"archive/zip"
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"embed"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"html"
+	"html/template"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+//go:embed web/*
+var webFS embed.FS
+
+const appVersion = "35.0"
+
+type Provider struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	BaseURL   string   `json:"baseUrl"`
+	APIKey    string   `json:"apiKey,omitempty"`
+	Model     string   `json:"model"`
+	Models    []string `json:"models,omitempty"`
+	MaxNewTok int      `json:"maxNewTok"`
+	HasAPIKey bool     `json:"hasApiKey,omitempty"`
+}
+type Config struct {
+	Providers []Provider `json:"providers"`
+}
+type Memory struct {
+	ID       string `json:"id"`
+	Text     string `json:"text"`
+	Created  string `json:"created"`
+	Updated  string `json:"updated,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Source   string `json:"source,omitempty"`
+	LastUsed string `json:"lastUsed,omitempty"`
+}
+type Conversation struct {
+	ID       string           `json:"id"`
+	Title    string           `json:"title"`
+	Folder   string           `json:"folder"`
+	Updated  string           `json:"updated"`
+	Messages []map[string]any `json:"messages"`
+}
+type GeoPosition struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+type ChatReq struct {
+	Provider      string           `json:"provider"`
+	Model         string           `json:"model,omitempty"`
+	Messages      []map[string]any `json:"messages"`
+	MaxNewTok     int              `json:"maxNewTok"`
+	Agent         bool             `json:"agent"`
+	Research      bool             `json:"research"`
+	AllowTerminal bool             `json:"allowTerminal"`
+	Location      *GeoPosition     `json:"location,omitempty"`
+}
+type ResearchReq struct {
+	Provider  string       `json:"provider"`
+	Model     string       `json:"model,omitempty"`
+	Query     string       `json:"query"`
+	MaxNewTok int          `json:"maxNewTok"`
+	Location  *GeoPosition `json:"location,omitempty"`
+}
+type ResearchJob struct {
+	ID        string              `json:"id"`
+	Status    string              `json:"status"`
+	Progress  []string            `json:"progress"`
+	Content   string              `json:"content,omitempty"`
+	Sources   []map[string]string `json:"sources,omitempty"`
+	Error     string              `json:"error,omitempty"`
+	StartedAt string              `json:"startedAt"`
+	UpdatedAt string              `json:"updatedAt"`
+}
+
+var researchMu sync.Mutex
+var researchJobs = map[string]*ResearchJob{}
+
+func newResearchJob() *ResearchJob {
+	id := strconv.FormatInt(time.Now().UnixNano(), 10)
+	now := time.Now().Format(time.RFC3339)
+	j := &ResearchJob{ID: id, Status: "queued", Progress: []string{}, StartedAt: now, UpdatedAt: now}
+	researchMu.Lock()
+	researchJobs[id] = j
+	researchMu.Unlock()
+	return j
+}
+
+func updateResearchJob(id, status, progress string) {
+	researchMu.Lock()
+	defer researchMu.Unlock()
+	j := researchJobs[id]
+	if j == nil {
+		return
+	}
+	j.Status = status
+	if progress != "" {
+		j.Progress = append(j.Progress, progress)
+		if len(j.Progress) > 100 {
+			j.Progress = j.Progress[len(j.Progress)-100:]
+		}
+	}
+	j.UpdatedAt = time.Now().Format(time.RFC3339)
+}
+
+func finishResearchJob(id, status, content string, sources []map[string]string, err error) {
+	researchMu.Lock()
+	defer researchMu.Unlock()
+	j := researchJobs[id]
+	if j == nil {
+		return
+	}
+	j.Status = status
+	j.Content = content
+	j.Sources = sources
+	if err != nil {
+		j.Error = err.Error()
+	}
+	j.UpdatedAt = time.Now().Format(time.RFC3339)
+}
+
+type CodeReq struct {
+	Language, Code string `json:"language"`
+}
+type TerminalReq struct {
+	Command       string `json:"command"`
+	CWD           string `json:"cwd"`
+	TimeoutSecond int    `json:"timeoutSeconds"`
+}
+type ArtifactFile struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+type ArtifactReq struct {
+	Files []ArtifactFile `json:"files"`
+}
+type TestProviderReq struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	BaseURL   string   `json:"baseUrl"`
+	APIKey    string   `json:"apiKey"`
+	Model     string   `json:"model"`
+	Models    []string `json:"models,omitempty"`
+	MaxNewTok int      `json:"maxNewTok"`
+}
+
+var mu sync.Mutex
+
+func dataDir() string {
+	d, _ := os.UserConfigDir()
+	p := filepath.Join(d, "AgentDesk")
+	_ = os.MkdirAll(p, 0700)
+	return p
+}
+func configPath() string       { return filepath.Join(dataDir(), "config.json") }
+func memoryPath() string       { return filepath.Join(dataDir(), "memory.json") }
+func conversationPath() string { return filepath.Join(dataDir(), "conversations.json") }
+
+func loadConfig() Config {
+	mu.Lock()
+	defer mu.Unlock()
+	b, e := os.ReadFile(configPath())
+	if e == nil {
+		var c Config
+		if json.Unmarshal(b, &c) == nil && len(c.Providers) > 0 {
+			return c
+		}
+	}
+	return Config{Providers: []Provider{{ID: "above", Name: "above.dev", BaseURL: "https://api.above.dev/v1", Model: "glm-5.3-flash-modal", MaxNewTok: 4096}}}
+}
+func saveConfig(c Config) error {
+	mu.Lock()
+	defer mu.Unlock()
+	b, _ := json.MarshalIndent(c, "", "  ")
+	return os.WriteFile(configPath(), b, 0600)
+}
+func loadMem() []Memory {
+	mu.Lock()
+	defer mu.Unlock()
+	b, e := os.ReadFile(memoryPath())
+	if e != nil {
+		return []Memory{}
+	}
+	var m []Memory
+	_ = json.Unmarshal(b, &m)
+	return m
+}
+func saveMem(m []Memory) error {
+	mu.Lock()
+	defer mu.Unlock()
+	b, _ := json.MarshalIndent(m, "", "  ")
+	return os.WriteFile(memoryPath(), b, 0600)
+}
+func loadConversations() []Conversation {
+	mu.Lock()
+	defer mu.Unlock()
+	b, e := os.ReadFile(conversationPath())
+	if e != nil {
+		return []Conversation{}
+	}
+	var c []Conversation
+	_ = json.Unmarshal(b, &c)
+	return c
+}
+func saveConversations(c []Conversation) error {
+	mu.Lock()
+	defer mu.Unlock()
+	b, _ := json.MarshalIndent(c, "", "  ")
+	return os.WriteFile(conversationPath(), b, 0600)
+}
+
+func jsonResp(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+func readJSON(r *http.Request, v any) error {
+	b, e := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	if e != nil {
+		return e
+	}
+	return json.Unmarshal(b, v)
+}
+func providerByID(id string) (Provider, error) {
+	c := loadConfig()
+	for _, p := range c.Providers {
+		if p.ID == id {
+			return p, nil
+		}
+	}
+	return Provider{}, fmt.Errorf("provider not found")
+}
+
+func normalizeProviderBase(raw string) string {
+	base := strings.TrimSpace(raw)
+	base = strings.TrimRight(base, "/")
+	for _, suffix := range []string{"/chat/completions", "/completions", "/models"} {
+		if strings.HasSuffix(strings.ToLower(base), suffix) {
+			base = strings.TrimRight(base[:len(base)-len(suffix)], "/")
+		}
+	}
+	return base
+}
+
+func doJSONOnce(p Provider, messages []map[string]any, tools []map[string]any, max int, tokenParam string) (map[string]any, int, string, error) {
+	prepared, prepErr := prepareProviderMessages(messages, filepath.Join(dataDir(), "uploads"))
+	if prepErr != nil {
+		return nil, 0, "", prepErr
+	}
+	payload := map[string]any{"model": p.Model, "messages": prepared, "stream": false}
+	if tokenParam == "max_completion_tokens" {
+		payload[tokenParam] = max
+	} else if tokenParam == "max_tokens" {
+		payload[tokenParam] = max
+	}
+	if len(tools) > 0 {
+		payload["tools"] = tools
+		payload["tool_choice"] = "auto"
+	}
+	b, _ := json.Marshal(payload)
+	endpoint := normalizeProviderBase(p.BaseURL) + "/chat/completions"
+	req, e := http.NewRequest("POST", endpoint, bytes.NewReader(b))
+	if e != nil {
+		return nil, 0, endpoint, e
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion+"")
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	client := &http.Client{Timeout: 180 * time.Second}
+	resp, e := client.Do(req)
+	if e != nil {
+		return nil, 0, endpoint, e
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if resp.StatusCode >= 400 {
+		return nil, resp.StatusCode, endpoint, fmt.Errorf("provider HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var out map[string]any
+	if e = json.Unmarshal(data, &out); e != nil {
+		return nil, resp.StatusCode, endpoint, fmt.Errorf("invalid provider JSON: %w", e)
+	}
+	return out, resp.StatusCode, endpoint, nil
+}
+
+func doJSON(p Provider, messages []map[string]any, tools []map[string]any, max int) (map[string]any, error) {
+	if max <= 0 {
+		max = p.MaxNewTok
+	}
+	if max <= 0 {
+		max = 4096
+	}
+	var last error
+	for _, tokenParam := range []string{"max_completion_tokens", "max_tokens"} {
+		out, status, _, err := doJSONOnce(p, messages, tools, max, tokenParam)
+		if err == nil {
+			return out, nil
+		}
+		last = err
+		msg := strings.ToLower(err.Error())
+		// Retry with the other common OpenAI-compatible token parameter when a provider rejects one.
+		if status >= 400 && (strings.Contains(msg, "max_completion_tokens") || strings.Contains(msg, "max_tokens") || strings.Contains(msg, "unknown parameter") || strings.Contains(msg, "unexpected field")) {
+			continue
+		}
+		break
+	}
+	return nil, last
+}
+
+func isGroqProvider(p Provider) bool {
+	u, err := url.Parse(normalizeProviderBase(p.BaseURL))
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "api.groq.com" || strings.HasSuffix(h, ".groq.com")
+}
+
+func isGroqBuiltInSearchModel(p Provider) bool {
+	if !isGroqProvider(p) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Model)) {
+	case "openai/gpt-oss-20b", "openai/gpt-oss-120b":
+		return true
+	default:
+		return false
+	}
+}
+
+func agentToolsForProvider(p Provider, allowTerminal bool, allowWeb bool) []map[string]any {
+	tools := []map[string]any{}
+	if allowWeb {
+		tools = agentTools()
+		if isGroqBuiltInSearchModel(p) {
+			tools = []map[string]any{{"type": "browser_search"}}
+		}
+	}
+	tools = append(tools, localAgentToolDefinitions(allowTerminal)...)
+	return tools
+}
+
+func agentTools() []map[string]any {
+	return []map[string]any{
+		{"type": "function", "function": map[string]any{"name": "web_search", "description": "Search the public web for current or factual information, then read the returned pages when possible.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}, "required": []string{"query"}}}},
+		{"type": "function", "function": map[string]any{"name": "open_url", "description": "Fetch readable text from a public HTTP/HTTPS web page.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{"type": "string"}}, "required": []string{"url"}}}},
+	}
+}
+
+var resultRe = regexp.MustCompile(`(?is)<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
+var snippetRe = regexp.MustCompile(`(?is)<a[^>]+class=["'][^"']*result__snippet[^"']*["'][^>]*>(.*?)</a>`)
+var bingItemRe = regexp.MustCompile(`(?is)<item>(.*?)</item>`)
+var bingTitleRe = regexp.MustCompile(`(?is)<title>(.*?)</title>`)
+var bingLinkRe = regexp.MustCompile(`(?is)<link>(.*?)</link>`)
+var bingDescRe = regexp.MustCompile(`(?is)<description>(.*?)</description>`)
+var googleLinkRe = regexp.MustCompile(`(?is)<a[^>]+href=["']/url\?q=([^&"']+)[^>]*>(.*?)</a>`)
+var tagRe = regexp.MustCompile(`<[^>]+>`)
+
+func stripTags(s string) string { return strings.TrimSpace(tagRe.ReplaceAllString(s, "")) }
+func cleanHTMLToText(src string) string {
+	s := regexp.MustCompile(`(?is)<(script|style|noscript|svg|canvas|iframe|template)[^>]*>.*?</\1>`).ReplaceAllString(src, " ")
+	s = regexp.MustCompile(`(?is)<!--.*?-->`).ReplaceAllString(s, " ")
+	s = regexp.MustCompile(`(?is)<(nav|footer|header|aside)[^>]*>.*?</\1>`).ReplaceAllString(s, " ")
+	s = regexp.MustCompile(`(?is)<(br|/p|/div|/li|/h1|/h2|/h3|/h4|/tr|/section)[^>]*>`).ReplaceAllString(s, "\n")
+	s = tagRe.ReplaceAllString(s, " ")
+	s = html.UnescapeString(s)
+	lines := strings.Split(strings.ReplaceAll(s, "\r", ""), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+var hrefRe = regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
+
+func extractPageLinks(base *url.URL, src string) []map[string]string {
+	matches := hrefRe.FindAllStringSubmatch(src, 80)
+	links := make([]map[string]string, 0, min(30, len(matches)))
+	seen := map[string]bool{}
+	for _, m := range matches {
+		href := strings.TrimSpace(html.UnescapeString(m[1]))
+		label := strings.Join(strings.Fields(stripTags(m[2])), " ")
+		if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(strings.ToLower(href), "javascript:") {
+			continue
+		}
+		ref, err := url.Parse(href)
+		if err != nil {
+			continue
+		}
+		abs := base.ResolveReference(ref)
+		if abs.Scheme != "http" && abs.Scheme != "https" {
+			continue
+		}
+		if seen[abs.String()] {
+			continue
+		}
+		seen[abs.String()] = true
+		links = append(links, map[string]string{"url": abs.String(), "text": label})
+		if len(links) >= 30 {
+			break
+		}
+	}
+	return links
+}
+
+func fetchHTTP(raw string) (map[string]any, error) {
+	u, e := url.Parse(raw)
+	if e != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("invalid URL")
+	}
+	req, _ := http.NewRequest("GET", raw, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 AgentDesk/"+appVersion+"")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.8")
+	resp, e := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if e != nil {
+		return nil, e
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 12<<20))
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if resp.StatusCode >= 400 {
+		return map[string]any{"url": raw, "contentType": ct, "error": fmt.Sprintf("HTTP %d", resp.StatusCode), "text": string(b)}, nil
+	}
+	title := u.Host + u.Path
+	text := ""
+	var links []map[string]string
+	if strings.Contains(ct, "text/html") || ct == "" {
+		src := string(b)
+		if tm := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`).FindStringSubmatch(src); len(tm) > 1 {
+			title = strings.Join(strings.Fields(html.UnescapeString(stripTags(tm[1]))), " ")
+		}
+		text = cleanHTMLToText(src)
+		links = extractPageLinks(u, src)
+	} else if strings.Contains(ct, "application/pdf") || strings.HasSuffix(strings.ToLower(u.Path), ".pdf") {
+		text = extractPDFText(b)
+	} else if strings.HasPrefix(ct, "text/") {
+		text = string(b)
+	}
+	text = strings.TrimSpace(text)
+	if len(text) > 30000 {
+		text = text[:30000]
+	}
+	return map[string]any{"url": raw, "title": title, "contentType": ct, "text": text, "links": links}, nil
+}
+
+func jinaRead(raw string) (map[string]any, error) {
+	readerURL := "https://r.jina.ai/" + raw
+	req, _ := http.NewRequest("GET", readerURL, nil)
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion+"")
+	resp, e := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+	if e != nil {
+		return nil, e
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("reader HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	text := strings.TrimSpace(string(body))
+	if len(text) > 40000 {
+		text = text[:40000]
+	}
+	u, _ := url.Parse(raw)
+	title := u.Host + u.Path
+	if strings.HasPrefix(text, "# ") {
+		if i := strings.IndexByte(text, '\n'); i > 2 {
+			title = strings.TrimSpace(strings.TrimPrefix(text[:i], "# "))
+		}
+	}
+	links := extractMarkdownLinks(u, text)
+	return map[string]any{"url": raw, "title": title, "contentType": "text/markdown", "text": text, "links": links, "reader": "jina"}, nil
+}
+
+var mdLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)]+)\)`)
+
+func extractMarkdownLinks(base *url.URL, text string) []map[string]string {
+	matches := mdLinkRe.FindAllStringSubmatch(text, 60)
+	seen := map[string]bool{}
+	out := make([]map[string]string, 0, min(30, len(matches)))
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		ref, err := url.Parse(html.UnescapeString(m[2]))
+		if err != nil {
+			continue
+		}
+		abs := base.ResolveReference(ref)
+		if abs.Scheme != "http" && abs.Scheme != "https" {
+			continue
+		}
+		if seen[abs.String()] {
+			continue
+		}
+		seen[abs.String()] = true
+		out = append(out, map[string]string{"url": abs.String(), "text": strings.TrimSpace(m[1])})
+		if len(out) >= 30 {
+			break
+		}
+	}
+	return out
+}
+
+func fetchPage(raw string) map[string]any {
+	if strings.TrimSpace(raw) == "" {
+		return map[string]any{"url": raw, "error": "empty URL"}
+	}
+	// Parallel Search MCP's web_fetch is the primary reader. It extracts the actual
+	// page content rather than returning only the URL, and works without a user API key.
+	if txt, err := parallelFetchRaw([]string{raw}, "Read the actual page contents and return the relevant text and links.", nil, false, ""); err == nil && strings.TrimSpace(txt) != "" {
+		u, _ := url.Parse(raw)
+		title := u.Host + u.Path
+		text := strings.TrimSpace(txt)
+		if len(text) > 40000 {
+			text = text[:40000] + "\n[page content truncated by AgentDesk]"
+		}
+		links := extractMarkdownLinks(u, text)
+		return map[string]any{"url": raw, "title": title, "contentType": "text/markdown", "text": text, "links": links, "reader": "parallel"}
+	}
+	// Local fetch is retained only as a resilience fallback for pages Parallel cannot extract.
+	page, err := fetchHTTP(raw)
+	if err == nil && page != nil {
+		text, _ := page["text"].(string)
+		if strings.TrimSpace(text) != "" {
+			return page
+		}
+	}
+	if page != nil {
+		if err != nil {
+			page["error"] = err.Error()
+		}
+		return page
+	}
+	return map[string]any{"url": raw, "error": fmt.Sprintf("Parallel web_fetch failed and local fetch failed: %v", err)}
+}
+func parseDDGResults(src string) []map[string]string {
+	matches := resultRe.FindAllStringSubmatch(src, 20)
+	snips := snippetRe.FindAllStringSubmatch(src, 20)
+	out := make([]map[string]string, 0, len(matches))
+	for i, m := range matches {
+		link := html.UnescapeString(strings.TrimSpace(m[1]))
+		if strings.HasPrefix(link, "//duckduckgo.com/l/?uddg=") {
+			if x, e := url.QueryUnescape(strings.TrimPrefix(link, "//duckduckgo.com/l/?uddg=")); e == nil {
+				link = x
+			}
+		}
+		title := strings.Join(strings.Fields(html.UnescapeString(stripTags(m[2]))), " ")
+		snip := ""
+		if i < len(snips) {
+			snip = strings.Join(strings.Fields(html.UnescapeString(stripTags(snips[i][1]))), " ")
+		}
+		if link != "" && title != "" {
+			out = append(out, map[string]string{"title": title, "url": link, "snippet": snip})
+		}
+	}
+	return out
+}
+
+func runSearchJina(q string) ([]map[string]string, error) {
+	if strings.TrimSpace(q) == "" {
+		return nil, fmt.Errorf("empty search query")
+	}
+	endpoint := "https://s.jina.ai/?q=" + url.QueryEscape(strings.TrimSpace(q))
+	req, _ := http.NewRequest("GET", endpoint, nil)
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion+"")
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 18<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("Jina Search HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	type item struct {
+		Title       string `json:"title"`
+		URL         string `json:"url"`
+		Content     string `json:"content"`
+		Description string `json:"description"`
+		Snippet     string `json:"snippet"`
+	}
+	var arr []item
+	if json.Unmarshal(body, &arr) != nil {
+		var obj struct {
+			Data    []item `json:"data"`
+			Results []item `json:"results"`
+		}
+		if err := json.Unmarshal(body, &obj); err != nil {
+			return nil, fmt.Errorf("Jina Search returned unreadable JSON")
+		}
+		if len(obj.Data) > 0 {
+			arr = obj.Data
+		} else {
+			arr = obj.Results
+		}
+	}
+	out := make([]map[string]string, 0, min(5, len(arr)))
+	for _, it := range arr {
+		if strings.TrimSpace(it.URL) == "" {
+			continue
+		}
+		snip := it.Snippet
+		if snip == "" {
+			snip = it.Description
+		}
+		m := map[string]string{"title": strings.TrimSpace(it.Title), "url": strings.TrimSpace(it.URL), "snippet": strings.TrimSpace(snip), "content": strings.TrimSpace(it.Content)}
+		out = append(out, m)
+		if len(out) >= 5 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("Jina Search returned no results")
+	}
+	return out, nil
+}
+
+func runSearchDDG(q string) ([]map[string]string, error) {
+	for _, endpoint := range []string{
+		"https://lite.duckduckgo.com/lite/?q=" + url.QueryEscape(q),
+		"https://html.duckduckgo.com/html/?q=" + url.QueryEscape(q),
+	} {
+		req, _ := http.NewRequest("GET", endpoint, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 AgentDesk/"+appVersion+"")
+		resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			continue
+		}
+		results := parseDDGResults(string(body))
+		if len(results) > 0 {
+			return results, nil
+		}
+	}
+	return nil, fmt.Errorf("DuckDuckGo search returned no readable results")
+}
+
+func runSearchBingRSS(q string) ([]map[string]string, error) {
+	endpoint := "https://www.bing.com/search?format=rss&q=" + url.QueryEscape(q)
+	req, _ := http.NewRequest("GET", endpoint, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 AgentDesk/"+appVersion+"")
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("Bing HTTP %d", resp.StatusCode)
+	}
+	var feed struct {
+		Items []struct {
+			Title       string `xml:"title"`
+			Link        string `xml:"link"`
+			Description string `xml:"description"`
+		} `xml:"channel>item"`
+	}
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		return nil, err
+	}
+	out := make([]map[string]string, 0, len(feed.Items))
+	for _, it := range feed.Items {
+		if it.Link != "" {
+			out = append(out, map[string]string{"title": html.UnescapeString(it.Title), "url": strings.TrimSpace(it.Link), "snippet": html.UnescapeString(stripTags(it.Description))})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("Bing search returned no results")
+	}
+	return out, nil
+}
+
+func runSearchGoogle(q string) ([]map[string]string, error) {
+	endpoint := "https://www.google.com/search?hl=en&num=10&q=" + url.QueryEscape(q)
+	req, _ := http.NewRequest("GET", endpoint, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36")
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 12<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("Google HTTP %d", resp.StatusCode)
+	}
+	matches := googleLinkRe.FindAllStringSubmatch(string(body), 20)
+	out := make([]map[string]string, 0, len(matches))
+	for _, m := range matches {
+		link, _ := url.QueryUnescape(m[1])
+		title := strings.Join(strings.Fields(html.UnescapeString(stripTags(m[2]))), " ")
+		if strings.HasPrefix(link, "http") && title != "" {
+			out = append(out, map[string]string{"title": title, "url": link, "snippet": ""})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("Google search returned no readable results")
+	}
+	return out, nil
+}
+
+func isWeatherQuery(q string) bool {
+	q = strings.ToLower(q)
+	return strings.Contains(q, "weather") || strings.Contains(q, "temperature") || strings.Contains(q, "forecast") || strings.Contains(q, "rain tomorrow")
+}
+
+func isMarketQuery(q string) bool {
+	l := strings.ToLower(strings.TrimSpace(q))
+	terms := []string{"stock", "stocks", "share price", "share prices", "ticker", "market cap", "p/e ratio", "pe ratio", "stock price", "shares of"}
+	for _, t := range terms {
+		if strings.Contains(l, t) {
+			return true
+		}
+	}
+	if resolveMarketSymbol(l) != "" && len(strings.Fields(l)) <= 6 {
+		return true
+	}
+	return false
+}
+
+func routineCodingRequest(q string) bool {
+	l := strings.ToLower(strings.TrimSpace(q))
+	verbs := []string{"write ", "create ", "build ", "make ", "code ", "program ", "script ", "implement ", "fix ", "debug "}
+	langs := []string{"python", "javascript", "typescript", "javascript", "html", "css", "java", "c++", "rust", "go ", "golang", "sql"}
+	hasVerb := false
+	for _, v := range verbs {
+		if strings.Contains(l, v) {
+			hasVerb = true
+			break
+		}
+	}
+	hasLang := false
+	for _, v := range langs {
+		if strings.Contains(l, v) {
+			hasLang = true
+			break
+		}
+	}
+	return hasVerb && hasLang && !looksLikeWebRequest(l)
+}
+
+func shouldOfferWebTools(q string, research bool) bool {
+	if looksLikeWebRequest(q) || isWeatherQuery(q) || isMarketQuery(q) {
+		return true
+	}
+	if research && routineCodingRequest(q) {
+		return false
+	}
+	return research
+}
+
+var marketTickerNames = map[string]string{
+	"amazon": "AMZN", "amazon.com": "AMZN", "amzn": "AMZN",
+	"apple": "AAPL", "aapl": "AAPL", "microsoft": "MSFT", "msft": "MSFT",
+	"nvidia": "NVDA", "nvda": "NVDA", "tesla": "TSLA", "tsla": "TSLA",
+	"meta": "META", "facebook": "META", "alphabet": "GOOGL", "google": "GOOGL",
+	"netflix": "NFLX", "nflx": "NFLX", "amd": "AMD", "intel": "INTC", "intc": "INTC",
+	"oracle": "ORCL", "orcl": "ORCL", "adobe": "ADBE", "adbe": "ADBE",
+	"roblox": "RBLX", "rblx": "RBLX", "palantir": "PLTR", "pltr": "PLTR",
+	"coinbase": "COIN", "uber": "UBER", "spotify": "SPOT", "disney": "DIS",
+	"nike": "NKE", "walmart": "WMT", "costco": "COST", "jpmorgan": "JPM",
+	"visa": "V", "mastercard": "MA", "berkshire": "BRK-B",
+}
+
+func resolveMarketSymbol(q string) string {
+	l := strings.ToLower(strings.TrimSpace(q))
+	for name, sym := range marketTickerNames {
+		if strings.Contains(l, name) {
+			return sym
+		}
+	}
+	if m := regexp.MustCompile(`\$([A-Za-z]{1,5}(?:-[A-Za-z])?)\b`).FindStringSubmatch(q); len(m) > 1 {
+		return strings.ToUpper(m[1])
+	}
+	for _, w := range regexp.MustCompile(`\b[A-Z]{1,5}(?:-[A-Z])?\b`).FindAllString(q, 12) {
+		if strings.ToUpper(w) == w {
+			return w
+		}
+	}
+	clean := strings.TrimSpace(strings.Trim(l, "?!.,:;\"'"))
+	followUp := false
+	if strings.HasPrefix(clean, "what about ") {
+		clean = strings.TrimSpace(strings.TrimPrefix(clean, "what about "))
+		followUp = true
+	}
+	if strings.HasPrefix(clean, "how about ") {
+		clean = strings.TrimSpace(strings.TrimPrefix(clean, "how about "))
+		followUp = true
+	}
+	if followUp && clean != "" && len(strings.Fields(clean)) <= 4 {
+		return yahooSearchSymbol(clean)
+	}
+	return ""
+}
+
+func yahooSearchSymbol(query string) string {
+	endpoint := "https://query1.finance.yahoo.com/v1/finance/search?q=" + url.QueryEscape(query) + "&quotesCount=5&newsCount=0"
+	req, _ := http.NewRequest("GET", endpoint, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 AgentDesk/"+appVersion)
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return ""
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	var v struct {
+		Quotes []struct {
+			Symbol    string `json:"symbol"`
+			QuoteType string `json:"quoteType"`
+		} `json:"quotes"`
+	}
+	if json.Unmarshal(body, &v) != nil {
+		return ""
+	}
+	for _, item := range v.Quotes {
+		if strings.EqualFold(item.QuoteType, "EQUITY") && strings.TrimSpace(item.Symbol) != "" {
+			return strings.ToUpper(item.Symbol)
+		}
+	}
+	return ""
+}
+
+func fetchYahooChart(symbol string) (map[string]any, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return nil, fmt.Errorf("no market symbol found")
+	}
+	var lastErr error
+	for _, host := range []string{"query1.finance.yahoo.com", "query2.finance.yahoo.com"} {
+		endpoint := "https://" + host + "/v8/finance/chart/" + url.PathEscape(symbol) + "?range=1d&interval=5m&includePrePost=true&events=div%2Csplits"
+		req, _ := http.NewRequest("GET", endpoint, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 AgentDesk/"+appVersion)
+		resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 6<<20))
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("Yahoo Finance HTTP %d", resp.StatusCode)
+			continue
+		}
+		var y struct {
+			Chart struct {
+				Result []struct {
+					Meta struct {
+						Symbol               string  `json:"symbol"`
+						ShortName            string  `json:"shortName"`
+						LongName             string  `json:"longName"`
+						ExchangeName         string  `json:"exchangeName"`
+						Currency             string  `json:"currency"`
+						RegularMarketPrice   float64 `json:"regularMarketPrice"`
+						PreviousClose        float64 `json:"previousClose"`
+						RegularMarketDayHigh float64 `json:"regularMarketDayHigh"`
+						RegularMarketDayLow  float64 `json:"regularMarketDayLow"`
+						RegularMarketVolume  float64 `json:"regularMarketVolume"`
+						FiftyTwoWeekHigh     float64 `json:"fiftyTwoWeekHigh"`
+						FiftyTwoWeekLow      float64 `json:"fiftyTwoWeekLow"`
+						MarketState          string  `json:"marketState"`
+					} `json:"meta"`
+					Timestamp  []int64 `json:"timestamp"`
+					Indicators struct {
+						Quote []struct {
+							Close []*float64 `json:"close"`
+						} `json:"quote"`
+					} `json:"indicators"`
+				} `json:"result"`
+			} `json:"chart"`
+		}
+		if err := json.Unmarshal(body, &y); err != nil || len(y.Chart.Result) == 0 {
+			lastErr = fmt.Errorf("invalid Yahoo Finance chart response")
+			continue
+		}
+		r := y.Chart.Result[0]
+		points := make([]map[string]any, 0, len(r.Timestamp))
+		if len(r.Indicators.Quote) > 0 {
+			closes := r.Indicators.Quote[0].Close
+			for i, ts := range r.Timestamp {
+				if i < len(closes) && closes[i] != nil {
+					points = append(points, map[string]any{"t": ts, "p": *closes[i]})
+				}
+			}
+		}
+		price := r.Meta.RegularMarketPrice
+		prev := r.Meta.PreviousClose
+		if prev == 0 && len(points) > 0 {
+			prev = points[0]["p"].(float64)
+		}
+		change, pct := price-prev, 0.0
+		if prev != 0 {
+			pct = (change / prev) * 100
+		}
+		return map[string]any{"symbol": symbol, "name": firstNonEmpty(r.Meta.LongName, r.Meta.ShortName, symbol), "exchange": r.Meta.ExchangeName, "currency": firstNonEmpty(r.Meta.Currency, "USD"), "price": price, "previousClose": prev, "change": change, "changePercent": pct, "dayHigh": r.Meta.RegularMarketDayHigh, "dayLow": r.Meta.RegularMarketDayLow, "volume": r.Meta.RegularMarketVolume, "weekHigh": r.Meta.FiftyTwoWeekHigh, "weekLow": r.Meta.FiftyTwoWeekLow, "marketState": r.Meta.MarketState, "points": points, "sourceURL": "https://finance.yahoo.com/chart/" + url.PathEscape(symbol), "source": "Yahoo Finance"}, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("Yahoo Finance unavailable")
+	}
+	return nil, lastErr
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func marketDataForQuery(q string) (map[string]any, error) {
+	symbol := resolveMarketSymbol(q)
+	if symbol == "" {
+		return nil, fmt.Errorf("could not identify a stock ticker")
+	}
+	return fetchYahooChart(symbol)
+}
+
+func extractLastUserText(msgs []map[string]any) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if role, _ := msgs[i]["role"].(string); role != "user" {
+			continue
+		}
+		switch c := msgs[i]["content"].(type) {
+		case string:
+			return c
+		case []any:
+			var parts []string
+			for _, part := range c {
+				pm, _ := part.(map[string]any)
+				if t, _ := pm["type"].(string); t == "text" {
+					if x, _ := pm["text"].(string); x != "" {
+						parts = append(parts, x)
+					}
+				}
+			}
+			return strings.Join(parts, "\n")
+		}
+	}
+	return ""
+}
+
+func looksLikeWebRequest(q string) bool {
+	l := strings.ToLower(strings.TrimSpace(q))
+	for _, needle := range []string{"search the web", "search online", "browse the web", "on the web", "look this up", "look it up", "research ", "research this", "latest news", "current news", "current price", "according to", "source this"} {
+		if strings.Contains(l, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func guessWeatherLocation(q string) string {
+	low := strings.ToLower(strings.TrimSpace(q))
+	for _, marker := range []string{" in ", " for ", " at ", " near "} {
+		if i := strings.Index(low, marker); i >= 0 {
+			loc := strings.TrimSpace(q[i+len(marker):])
+			for _, suffix := range []string{"?", ".", " using web search", " with web search", " via web search", " today", " right now", " current", " currently", " this week", " tomorrow", " forecast"} {
+				loc = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(loc), suffix))
+			}
+			if loc != "" {
+				return loc
+			}
+		}
+	}
+	return ""}
+
+func weatherResult(q string, pos *GeoPosition) (map[string]any, error) {
+	loc := guessWeatherLocation(q)
+	var lat, lon float64
+	var name, admin1, country, timezone string
+	if pos != nil && pos.Latitude != 0 && pos.Longitude != 0 {
+		lat, lon = pos.Latitude, pos.Longitude
+		name = "your location"
+	} else {
+		if loc == "" {
+			return nil, fmt.Errorf("no weather location found; include a city/state or allow location access in AgentDesk")
+		}
+		geoURL := "https://geocoding-api.open-meteo.com/v1/search?name=" + url.QueryEscape(loc) + "&count=1&language=en&format=json"
+		geoReq, _ := http.NewRequest("GET", geoURL, nil)
+		geoResp, err := (&http.Client{Timeout: 15 * time.Second}).Do(geoReq)
+		if err != nil {
+			return nil, err
+		}
+		geoBody, _ := io.ReadAll(io.LimitReader(geoResp.Body, 2<<20))
+		geoResp.Body.Close()
+		if geoResp.StatusCode >= 400 {
+			return nil, fmt.Errorf("geocoding HTTP %d", geoResp.StatusCode)
+		}
+		var geo struct {
+			Results []struct {
+				Name      string  `json:"name"`
+				Latitude  float64 `json:"latitude"`
+				Longitude float64 `json:"longitude"`
+				Admin1    string  `json:"admin1"`
+				Country   string  `json:"country"`
+				Timezone  string  `json:"timezone"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(geoBody, &geo); err != nil || len(geo.Results) == 0 {
+			return nil, fmt.Errorf("location not found: %s", loc)
+		}
+		g := geo.Results[0]
+		name, admin1, country, timezone = g.Name, g.Admin1, g.Country, g.Timezone
+		lat, lon = g.Latitude, g.Longitude
+	}
+	wxURL := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max&forecast_days=2&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto", lat, lon)
+	wxReq, _ := http.NewRequest("GET", wxURL, nil)
+	wxResp, err := (&http.Client{Timeout: 15 * time.Second}).Do(wxReq)
+	if err != nil {
+		return nil, err
+	}
+	defer wxResp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(wxResp.Body, 4<<20))
+	if wxResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("weather HTTP %d", wxResp.StatusCode)
+	}
+	var wx struct {
+		Current      map[string]any `json:"current"`
+		CurrentUnits map[string]any `json:"current_units"`
+		Daily        map[string]any `json:"daily"`
+		DailyUnits   map[string]any `json:"daily_units"`
+	}
+	if err := json.Unmarshal(body, &wx); err != nil {
+		return nil, err
+	}
+	label := name
+	if label == "" || label == "your location" {
+		label = "your location"
+	}
+	wantTomorrow := strings.Contains(strings.ToLower(q), "tomorrow")
+	content := fmt.Sprintf("Location: %s", label)
+	if admin1 != "" || country != "" {
+		content += fmt.Sprintf(", %s, %s", admin1, country)
+	}
+	if timezone != "" {
+		content += "\nTimezone: " + timezone
+	}
+	if wantTomorrow {
+		content += "\nTomorrow's forecast data: " + mustJSON(wx.Daily) + "\nUnits: " + mustJSON(wx.DailyUnits)
+	} else {
+		content += "\nCurrent weather data: " + mustJSON(wx.Current) + "\nUnits: " + mustJSON(wx.CurrentUnits)
+		content += "\nForecast data (next two days): " + mustJSON(wx.Daily)
+	}
+	return map[string]any{
+		"title":   fmt.Sprintf("Weather for %s", label),
+		"url":     "https://open-meteo.com/",
+		"snippet": fmt.Sprintf("Live weather data for %s from Open-Meteo.", label),
+		"content": content,
+		"links":   []map[string]string{{"url": "https://open-meteo.com/", "text": "Open-Meteo"}},
+		"source":  "Open-Meteo",
+	}, nil
+}
+
+func enrichSearchResults(results []map[string]string) []map[string]any {
+	limit := min(6, len(results))
+	out := make([]map[string]any, limit)
+	var wg sync.WaitGroup
+	for i := 0; i < limit; i++ {
+		i := i
+		r := results[i]
+		out[i] = map[string]any{"title": r["title"], "url": r["url"], "snippet": r["snippet"]}
+		if existing := strings.TrimSpace(r["content"]); existing != "" {
+			if len(existing) > 8000 {
+				existing = existing[:8000] + "\n[page content truncated by AgentDesk]"
+			}
+			out[i]["content"] = existing
+			continue
+		}
+		if strings.TrimSpace(r["url"]) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			page := fetchPage(r["url"])
+			if txt, _ := page["text"].(string); txt != "" {
+				if len(txt) > 8000 {
+					txt = txt[:8000] + "\n[page content truncated by AgentDesk]"
+				}
+				out[i]["content"] = txt
+			}
+			if title, ok := page["title"].(string); ok && title != "" {
+				out[i]["title"] = title
+			}
+			if links, ok := page["links"].([]map[string]string); ok {
+				out[i]["links"] = links[:min(10, len(links))]
+			}
+			if errText, ok := page["error"].(string); ok {
+				out[i]["readError"] = errText
+			}
+			if reader, ok := page["reader"].(string); ok {
+				out[i]["reader"] = reader
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+func runSearchDDGInstant(q string) ([]map[string]string, error) {
+	endpoint := "https://api.duckduckgo.com/?q=" + url.QueryEscape(q) + "&format=json&no_html=1&skip_disambig=1"
+	req, _ := http.NewRequest("GET", endpoint, nil)
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion+"")
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 6<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("DuckDuckGo API HTTP %d", resp.StatusCode)
+	}
+	var x struct {
+		Heading      string `json:"Heading"`
+		AbstractText string `json:"AbstractText"`
+		AbstractURL  string `json:"AbstractURL"`
+		Related      []struct {
+			Text     string `json:"Text"`
+			FirstURL string `json:"FirstURL"`
+		} `json:"RelatedTopics"`
+	}
+	if err := json.Unmarshal(body, &x); err != nil {
+		return nil, err
+	}
+	out := make([]map[string]string, 0, 8)
+	if x.AbstractURL != "" || x.AbstractText != "" {
+		out = append(out, map[string]string{"title": x.Heading, "url": x.AbstractURL, "snippet": x.AbstractText})
+	}
+	for _, r := range x.Related {
+		if r.FirstURL != "" && r.Text != "" {
+			out = append(out, map[string]string{"title": r.Text, "url": r.FirstURL, "snippet": r.Text})
+		}
+		if len(out) >= 8 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("DuckDuckGo API returned no results")
+	}
+	return out, nil
+}
+
+func runSearchWithLocation(q string, pos *GeoPosition) []map[string]any {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return nil
+	}
+
+	// Keep weather on the dedicated live-data path. For all general web searches,
+	// AgentDesk now uses Parallel's anonymous Search MCP as the primary backend.
+	if isWeatherQuery(q) {
+		if wr, err := weatherResult(q, pos); err == nil {
+			return []map[string]any{wr}
+		}
+	}
+
+	raw, err := parallelSearchRaw(q, []string{q}, "")
+	if err != nil {
+		// A concise diagnostic is more useful than silently pretending the search worked.
+		return []map[string]any{{"title": "Parallel Search MCP unavailable", "url": "https://search.parallel.ai/mcp", "snippet": "Parallel Search MCP could not complete this search.", "content": err.Error(), "source": "Parallel Search MCP"}}
+	}
+	rows := parseParallelMarkdownResults(raw)
+	if len(rows) == 0 {
+		return []map[string]any{{"title": "Parallel Search returned no links", "url": "https://search.parallel.ai/mcp", "snippet": "The search service returned content but no readable links were found.", "content": raw, "source": "Parallel Search MCP"}}
+	}
+	// Keep the actual Parallel output so the agent can see excerpts/citations, then read
+	// the top pages with Parallel web_fetch to provide page contents too.
+	for i := range rows {
+		rows[i]["content"] = raw
+	}
+	return enrichSearchResults(rows)
+}
+
+func runSearch(q string) []map[string]any {
+	return runSearchWithLocation(q, nil)
+}
+
+func withMemory(msgs []map[string]any) []map[string]any {
+	m := relevantMemories(extractLastUserText(msgs), 16)
+	if len(m) == 0 {
+		return msgs
+	}
+	var b strings.Builder
+	b.WriteString("Persistent local memory is available across chats. Use it when relevant; memory_search can retrieve more when needed. Never reveal private memory unless it is relevant to the user's request.\n")
+	for _, x := range m {
+		b.WriteString("- [" + x.Kind + "] " + x.Text + "\n")
+	}
+	return append([]map[string]any{{"role": "system", "content": b.String()}}, msgs...)
+}
+
+func compactWebToolResult(result []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, min(5, len(result)))
+	for _, r := range result {
+		m := map[string]any{}
+		for _, k := range []string{"title", "url", "snippet", "source", "reader"} {
+			if v, ok := r[k]; ok {
+				m[k] = v
+			}
+		}
+		if txt, ok := r["content"].(string); ok && strings.TrimSpace(txt) != "" {
+			if len(txt) > 3500 {
+				txt = txt[:3500] + "\n[page content truncated by AgentDesk]"
+			}
+			m["content"] = txt
+		}
+		if links, ok := r["links"].([]map[string]string); ok {
+			m["links"] = links[:min(8, len(links))]
+		}
+		out = append(out, m)
+		if len(out) >= 5 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return []map[string]any{{"error": "No readable search results were returned."}}
+	}
+	return out
+}
+
+func chatWithTools(p Provider, msgs []map[string]any, agent bool, max int, progress func(string), allowTerminal bool) (string, error) {
+	messages := withMemory(msgs)
+	if hasImageAttachments(msgs) && !modelSupportsVision(p) {
+		messages = replaceUnsupportedImages(messages, allowTerminal)
+	}
+	tools := []map[string]any(nil)
+	if agent {
+		tools = agentToolsForProvider(p, allowTerminal, shouldOfferWebTools(extractLastUserText(msgs), true))
+	}
+	if max <= 0 {
+		max = p.MaxNewTok
+	}
+	if max <= 0 {
+		max = 4096
+	}
+	for round := 0; round < 8; round++ {
+		out, e := doJSON(p, messages, tools, max)
+		if e != nil {
+			return "", e
+		}
+		ch, _ := out["choices"].([]any)
+		if len(ch) == 0 {
+			return "", fmt.Errorf("provider returned no choices")
+		}
+		choice, _ := ch[0].(map[string]any)
+		msg, _ := choice["message"].(map[string]any)
+		calls, _ := msg["tool_calls"].([]any)
+		if len(calls) == 0 {
+			c := messageText(msg["content"])
+			if strings.TrimSpace(c) != "" {
+				return c, nil
+			}
+			return "", fmt.Errorf("model returned an empty response")
+		}
+		messages = append(messages, msg)
+		for _, raw := range calls {
+			call, _ := raw.(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			args, _ := fn["arguments"].(string)
+			id, _ := call["id"].(string)
+			var result any
+			switch name {
+			case "web_search":
+				var a struct {
+					Query string `json:"query"`
+				}
+				_ = json.Unmarshal([]byte(args), &a)
+				if progress != nil {
+					progress("Searching the web: " + a.Query)
+				}
+				result = compactWebToolResult(runSearchWithLocation(a.Query, nil))
+			case "open_url":
+				var a struct {
+					URL string `json:"url"`
+				}
+				_ = json.Unmarshal([]byte(args), &a)
+				if progress != nil {
+					progress("Reading: " + a.URL)
+				}
+				result = fetchPage(a.URL)
+			default:
+				localResult, label, localErr := executeAgentLocalTool(name, args, allowTerminal)
+				if localErr != nil {
+					result = map[string]any{"ok": false, "error": localErr.Error()}
+				} else {
+					result = localResult
+				}
+				if progress != nil && label != "" {
+					progress(label)
+				}
+			}
+			rb, _ := json.Marshal(result)
+			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": id, "content": string(rb)})
+		}
+	}
+	return "", fmt.Errorf("agent tool loop exceeded its limit")
+}
+
+func streamJSONResponse(w http.ResponseWriter, p Provider, messages []map[string]any, tools []map[string]any, max int, onChunk func(string)) (map[string]any, string, int, error) {
+	prepared, err := prepareProviderMessages(messages, filepath.Join(dataDir(), "uploads"))
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if max <= 0 {
+		max = p.MaxNewTok
+	}
+	if max <= 0 {
+		max = 4096
+	}
+	var resp *http.Response
+	var last error
+	for _, param := range []string{"max_completion_tokens", "max_tokens"} {
+		payload := map[string]any{"model": p.Model, "messages": prepared, param: max, "stream": true}
+		if len(tools) > 0 {
+			payload["tools"] = tools
+			payload["tool_choice"] = "auto"
+		}
+		body, _ := json.Marshal(payload)
+		req, err := http.NewRequest("POST", normalizeProviderBase(p.BaseURL)+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, "", 0, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("User-Agent", "AgentDesk/"+appVersion)
+		if p.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		}
+		r, err := (&http.Client{Timeout: 180 * time.Second}).Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		if r.StatusCode >= 400 {
+			d, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+			r.Body.Close()
+			last = fmt.Errorf("provider HTTP %d: %s", r.StatusCode, strings.TrimSpace(string(d)))
+			low := strings.ToLower(last.Error())
+			if strings.Contains(low, "max_completion_tokens") || strings.Contains(low, "max_tokens") || strings.Contains(low, "unknown parameter") || strings.Contains(low, "unexpected field") {
+				continue
+			}
+			return nil, "", 0, last
+		}
+		resp = r
+		break
+	}
+	if resp == nil {
+		return nil, "", 0, last
+	}
+	defer resp.Body.Close()
+	if _, ok := w.(http.Flusher); !ok {
+		return nil, "", 0, fmt.Errorf("stream unsupported")
+	}
+	fl := w.(http.Flusher)
+	reader := bufio.NewReader(resp.Body)
+	var content strings.Builder
+	finish := ""
+	completionTokens := 0
+	type toolAccum struct {
+		ID   string
+		Name string
+		Args strings.Builder
+	}
+	accs := map[int]*toolAccum{}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return nil, finish, completionTokens, err
+		}
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data:") {
+			d := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if d == "[DONE]" {
+				break
+			}
+			var x map[string]any
+			if json.Unmarshal([]byte(d), &x) == nil {
+				if u, ok := x["usage"].(map[string]any); ok {
+					if v, ok := u["completion_tokens"].(float64); ok {
+						completionTokens = int(v)
+					}
+				}
+				if ch, ok := x["choices"].([]any); ok && len(ch) > 0 {
+					c, _ := ch[0].(map[string]any)
+					if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+						finish = strings.ToLower(strings.TrimSpace(fr))
+					}
+					if delta, ok := c["delta"].(map[string]any); ok {
+						if txt := messageText(delta["content"]); txt != "" {
+							content.WriteString(txt)
+							if onChunk != nil {
+								onChunk(txt)
+							}
+						}
+						if rawCalls, ok := delta["tool_calls"].([]any); ok {
+							for _, raw := range rawCalls {
+								call, _ := raw.(map[string]any)
+								idx := 0
+								switch v := call["index"].(type) {
+								case float64:
+									idx = int(v)
+								case int:
+									idx = v
+								}
+								acc := accs[idx]
+								if acc == nil {
+									acc = &toolAccum{}
+									accs[idx] = acc
+								}
+								if id, ok := call["id"].(string); ok && id != "" {
+									acc.ID = id
+								}
+								if fn, ok := call["function"].(map[string]any); ok {
+									if n, ok := fn["name"].(string); ok && n != "" {
+										acc.Name = n
+									}
+									if a, ok := fn["arguments"].(string); ok {
+										acc.Args.WriteString(a)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+	msg := map[string]any{"role": "assistant", "content": content.String()}
+	if len(accs) > 0 {
+		idxs := make([]int, 0, len(accs))
+		for ix := range accs {
+			idxs = append(idxs, ix)
+		}
+		for i := 0; i < len(idxs); i++ {
+			for j := i + 1; j < len(idxs); j++ {
+				if idxs[j] < idxs[i] {
+					idxs[i], idxs[j] = idxs[j], idxs[i]
+				}
+			}
+		}
+		calls := make([]any, 0, len(idxs))
+		for _, ix := range idxs {
+			a := accs[ix]
+			calls = append(calls, map[string]any{"id": a.ID, "type": "function", "function": map[string]any{"name": a.Name, "arguments": a.Args.String()}})
+		}
+		msg["tool_calls"] = calls
+	}
+	fl.Flush()
+	return msg, func() string {
+		if finish == "" {
+			return "stop"
+		}
+		return finish
+	}(), completionTokens, nil
+}
+
+func streamFinal(w http.ResponseWriter, p Provider, messages []map[string]any, max int) error {
+	prepared, prepErr := prepareProviderMessages(messages, filepath.Join(dataDir(), "uploads"))
+	if prepErr != nil {
+		return prepErr
+	}
+	if max <= 0 {
+		max = p.MaxNewTok
+	}
+	if max <= 0 {
+		max = 4096
+	}
+	var resp *http.Response
+	var last error
+	for _, tokenParam := range []string{"max_completion_tokens", "max_tokens"} {
+		payload := map[string]any{"model": p.Model, "messages": prepared, tokenParam: max, "stream": true}
+		b, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("POST", normalizeProviderBase(p.BaseURL)+"/chat/completions", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "AgentDesk/"+appVersion+"")
+		if p.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		}
+		r, e := (&http.Client{Timeout: 180 * time.Second}).Do(req)
+		if e != nil {
+			last = e
+			continue
+		}
+		if r.StatusCode >= 400 {
+			d, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+			r.Body.Close()
+			last = fmt.Errorf("provider HTTP %d: %s", r.StatusCode, strings.TrimSpace(string(d)))
+			msg := strings.ToLower(last.Error())
+			if strings.Contains(msg, "max_completion_tokens") || strings.Contains(msg, "max_tokens") || strings.Contains(msg, "unknown parameter") || strings.Contains(msg, "unexpected field") {
+				continue
+			}
+			return last
+		}
+		resp = r
+		break
+	}
+	if resp == nil {
+		return last
+	}
+	defer resp.Body.Close()
+	sc := bufio.NewScanner(resp.Body)
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("stream unsupported")
+	}
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		d := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if d == "[DONE]" {
+			break
+		}
+		var x map[string]any
+		if json.Unmarshal([]byte(d), &x) != nil {
+			continue
+		}
+		ch, _ := x["choices"].([]any)
+		if len(ch) == 0 {
+			continue
+		}
+		c, _ := ch[0].(map[string]any)
+		delta, _ := c["delta"].(map[string]any)
+		t, _ := delta["content"].(string)
+		if t != "" {
+			bb, _ := json.Marshal(map[string]string{"type": "chunk", "text": t})
+			fmt.Fprintf(w, "data: %s\n\n", bb)
+			fl.Flush()
+		}
+	}
+	_, _ = io.WriteString(w, "data: {\"type\":\"done\"}\n\n")
+	fl.Flush()
+	return sc.Err()
+}
+
+func formatProviderError(err error) string {
+	if err == nil {
+		return "unknown provider error"
+	}
+	msg := strings.TrimSpace(err.Error())
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "network is unreachable") || strings.Contains(low, "temporary failure in name resolution") || strings.Contains(low, "dial tcp") || strings.Contains(low, "connection refused") || strings.Contains(low, "i/o timeout") || strings.Contains(low, "tls handshake timeout") {
+		return "Provider network error: " + msg + "\nCheck the Base URL, internet/firewall access, and whether the provider is reachable from this computer."
+	}
+	return msg
+}
+
+func chat(w http.ResponseWriter, r *http.Request) {
+	var req ChatReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	p, e := providerByID(req.Provider)
+	if e != nil {
+		http.Error(w, e.Error(), 404)
+		return
+	}
+	useAgent := req.Agent || looksLikeWebRequest(extractLastUserText(req.Messages)) || isWeatherQuery(extractLastUserText(req.Messages))
+	if useAgent {
+		c, err := chatWithTools(p, augmentLiveContext(req.Messages, req.Location), true, req.MaxNewTok, nil, req.AllowTerminal)
+		if err != nil {
+			http.Error(w, formatProviderError(err), 502)
+			return
+		}
+		jsonResp(w, map[string]any{"content": c})
+		return
+	}
+	c, err := chatWithTools(p, augmentLiveContext(req.Messages, req.Location), false, req.MaxNewTok, nil, false)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	jsonResp(w, map[string]any{"content": c})
+}
+
+func augmentLiveContext(messages []map[string]any, pos *GeoPosition) []map[string]any {
+	q := extractLastUserText(messages)
+	if q == "" {
+		return messages
+	}
+	if isWeatherQuery(q) {
+		if wr, err := weatherResult(q, pos); err == nil {
+			rb, _ := json.Marshal(wr)
+			note := "Live weather data retrieved by AgentDesk. Use this data rather than claiming you cannot access real-time weather."
+			return append([]map[string]any{{"role": "system", "content": note + "\n\n" + string(rb)}}, messages...)
+		}
+	}
+	return messages
+}
+
+func terminalDetails() map[string]any {
+	details := map[string]any{"os": runtime.GOOS, "shell": "bash", "display": "Linux / Bash", "cwd": ""}
+	home, _ := os.UserHomeDir()
+	details["cwd"] = home
+	switch runtime.GOOS {
+	case "windows":
+		details["shell"] = "powershell.exe"
+		details["display"] = "Windows / PowerShell"
+	case "darwin":
+		details["shell"] = "zsh"
+		details["display"] = "macOS / zsh"
+	case "linux":
+		distro := "Linux"
+		if b, err := os.ReadFile("/etc/os-release"); err == nil {
+			for _, line := range strings.Split(string(b), "\n") {
+				if strings.HasPrefix(line, "PRETTY_NAME=") {
+					val := strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
+					if val != "" {
+						distro = val
+					}
+				}
+			}
+		}
+		details["display"] = distro + " / Bash"
+		details["distro"] = distro
+	}
+	return details
+}
+
+func runTerminalCommand(req TerminalReq) map[string]any {
+	command := strings.TrimSpace(req.Command)
+	if command == "" {
+		return map[string]any{"ok": false, "error": "Empty command."}
+	}
+	timeout := req.TimeoutSecond
+	if timeout <= 0 {
+		timeout = 30
+	}
+	if timeout > 120 {
+		timeout = 120
+	}
+	cwd := strings.TrimSpace(req.CWD)
+	if cwd == "" {
+		cwd, _ = os.UserHomeDir()
+	}
+	if cwd == "" {
+		cwd = "."
+	}
+	if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
+		return map[string]any{"ok": false, "error": "Working directory does not exist: " + cwd}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	defer cancel()
+	var cmd *exec.Cmd
+	details := terminalDetails()
+	switch runtime.GOOS {
+	case "windows":
+		shell := "powershell.exe"
+		if found, err := exec.LookPath(shell); err == nil {
+			shell = found
+		}
+		cmd = exec.CommandContext(ctx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command)
+	case "darwin":
+		shell := "/bin/zsh"
+		if _, err := os.Stat(shell); err != nil {
+			shell = "/bin/bash"
+		}
+		cmd = exec.CommandContext(ctx, shell, "-lc", command)
+	default:
+		shell := "/bin/bash"
+		if _, err := os.Stat(shell); err != nil {
+			shell = "/bin/sh"
+		}
+		cmd = exec.CommandContext(ctx, shell, "-lc", command)
+	}
+	cmd.Dir = cwd
+	configureHiddenCommand(cmd)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return map[string]any{"ok": false, "output": out.String(), "error": fmt.Sprintf("Command timed out after %d seconds.", timeout), "terminal": details}
+	}
+	text := out.String()
+	if len(text) > 30000 {
+		text = text[:30000] + "\n[terminal output truncated]"
+	}
+	result := map[string]any{"ok": err == nil, "output": text, "terminal": details}
+	if err != nil {
+		result["error"] = err.Error()
+	}
+	return result
+}
+
+func terminalInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	jsonResp(w, terminalDetails())
+}
+
+func terminalRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req TerminalReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid", 400)
+		return
+	}
+	jsonResp(w, runTerminalCommand(req))
+}
+
+func safeArtifactName(name string, fallback string) string {
+	name = strings.TrimSpace(filepath.Base(name))
+	if name == "." || name == string(filepath.Separator) || name == "" || name == ".." {
+		name = fallback
+	}
+	name = strings.Map(func(r rune) rune {
+		if r < 32 || strings.ContainsRune(`<>:\"/\\|?*`, r) {
+			return '_'
+		}
+		return r
+	}, name)
+	if name == "" {
+		name = fallback
+	}
+	return name
+}
+
+func createArtifacts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req ArtifactReq
+	if readJSON(r, &req) != nil || len(req.Files) == 0 {
+		http.Error(w, "at least one file is required", 400)
+		return
+	}
+	if len(req.Files) > 50 {
+		http.Error(w, "too many files", 400)
+		return
+	}
+	total := 0
+	for _, f := range req.Files {
+		if strings.TrimSpace(f.Name) == "" || len(f.Content) > 500000 {
+			http.Error(w, "invalid artifact file", 400)
+			return
+		}
+		total += len(f.Content)
+	}
+	if total > 8<<20 {
+		http.Error(w, "artifact package too large", 400)
+		return
+	}
+	id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	dir := filepath.Join(dataDir(), "artifacts", id)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	used := map[string]bool{}
+	files := make([]string, 0, len(req.Files))
+	for i, f := range req.Files {
+		base := safeArtifactName(f.Name, fmt.Sprintf("file-%d.txt", i+1))
+		name := base
+		for n := 2; used[strings.ToLower(name)]; n++ {
+			ext := filepath.Ext(base)
+			stem := strings.TrimSuffix(base, ext)
+			name = fmt.Sprintf("%s-%d%s", stem, n, ext)
+		}
+		used[strings.ToLower(name)] = true
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(f.Content), 0600); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		files = append(files, name)
+	}
+	if len(files) > 1 {
+		zipPath := filepath.Join(dir, "AgentDesk-code.zip")
+		zh, err := os.Create(zipPath)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		zw := zip.NewWriter(zh)
+		for _, name := range files {
+			fh, err := os.Open(filepath.Join(dir, name))
+			if err != nil {
+				zw.Close()
+				zh.Close()
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			entry, err := zw.Create(name)
+			if err == nil {
+				_, err = io.Copy(entry, fh)
+			}
+			fh.Close()
+			if err != nil {
+				zw.Close()
+				zh.Close()
+				http.Error(w, err.Error(), 500)
+				return
+			}
+		}
+		if err := zw.Close(); err != nil {
+			zh.Close()
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := zh.Close(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
+	downloadName := files[0]
+	if len(files) > 1 {
+		downloadName = "AgentDesk-code.zip"
+	}
+	jsonResp(w, map[string]any{"ok": true, "id": id, "files": files, "multiple": len(files) > 1, "downloadName": downloadName, "url": "/api/artifacts/" + url.PathEscape(id)})
+}
+
+func artifactDownload(w http.ResponseWriter, r *http.Request) {
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/artifacts/"), "/")
+	if id == "" || strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") {
+		http.Error(w, "invalid artifact", 400)
+		return
+	}
+	dir := filepath.Join(dataDir(), "artifacts", id)
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		http.Error(w, "artifact not found", 404)
+		return
+	}
+	path := filepath.Join(dir, "AgentDesk-code.zip")
+	name := "AgentDesk-code.zip"
+	if _, err := os.Stat(path); err != nil {
+		entries, _ := os.ReadDir(dir)
+		var first string
+		for _, e := range entries {
+			if !e.IsDir() && e.Name() != "AgentDesk-code.zip" && e.Name() != "manifest.json" {
+				first = e.Name()
+				break
+			}
+		}
+		if first == "" {
+			http.Error(w, "artifact empty", 404)
+			return
+		}
+		path = filepath.Join(dir, first)
+		name = first
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+strings.ReplaceAll(name, `"`, "_")+`"`)
+	w.Header().Set("Content-Type", mime.TypeByExtension(filepath.Ext(name)))
+	w.Header().Set("X-Content-Disposition-Filename", name)
+	http.ServeFile(w, r, path)
+}
+
+func messageText(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []any:
+		var parts []string
+		for _, item := range x {
+			if s := messageText(item); strings.TrimSpace(s) != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "")
+	case map[string]any:
+		if s, ok := x["text"].(string); ok {
+			return s
+		}
+		if s, ok := x["content"]; ok {
+			return messageText(s)
+		}
+		if s, ok := x["output_text"]; ok {
+			return messageText(s)
+		}
+		if s, ok := x["value"]; ok {
+			return messageText(s)
+		}
+	}
+	return ""
+}
+
+func extractContentFromResponse(out map[string]any) string {
+	ch, _ := out["choices"].([]any)
+	if len(ch) == 0 {
+		return ""
+	}
+	choice, _ := ch[0].(map[string]any)
+	msg, _ := choice["message"].(map[string]any)
+	if c, ok := msg["content"].(string); ok {
+		return c
+	}
+	return ""
+}
+
+func responseChoiceMeta(out map[string]any) (map[string]any, string, int) {
+	ch, _ := out["choices"].([]any)
+	if len(ch) == 0 {
+		return nil, "", 0
+	}
+	choice, _ := ch[0].(map[string]any)
+	finish, _ := choice["finish_reason"].(string)
+	completionTokens := 0
+	if usage, ok := out["usage"].(map[string]any); ok {
+		switch v := usage["completion_tokens"].(type) {
+		case float64:
+			completionTokens = int(v)
+		case int:
+			completionTokens = v
+		}
+	}
+	msg, _ := choice["message"].(map[string]any)
+	return msg, strings.ToLower(strings.TrimSpace(finish)), completionTokens
+}
+
+func approximateTokens(s string) int {
+	// Fallback for compatible providers that omit usage.completion_tokens.
+	// Four UTF-8 bytes per token is intentionally conservative and only used
+	// to keep long-running continuation loops bounded.
+	n := len([]rune(s)) / 4
+	if n < 1 && strings.TrimSpace(s) != "" {
+		n = 1
+	}
+	return n
+}
+
+func sourceSystemInstruction() map[string]any {
+	return map[string]any{"role": "system", "content": "When AgentDesk provides web research, use compact source IDs such as [S1] or [S2] only when attribution is useful. The desktop UI already displays full source titles and URLs in a Sources rail. NEVER write a bibliography, Sources/References section, raw URLs, or a list of links. Prefer at most one [S#] citation per paragraph and no more than 12 source citations in the entire answer unless the user explicitly asks for exhaustive citations. Do not spend response budget restating source metadata. Never invent a source ID. AgentDesk also has persistent memory across chats: when the user states a durable preference, project detail, recurring instruction, or useful long-term fact, use memory_update to save it; use memory_search when older context is needed. Never store secrets or hidden reasoning."}
+}
+
+type citationTracker struct {
+	Next    int
+	ByURL   map[string]string
+	Sources []map[string]string
+}
+
+func newCitationTracker() *citationTracker {
+	return &citationTracker{Next: 1, ByURL: map[string]string{}, Sources: []map[string]string{}}
+}
+
+func (c *citationTracker) Register(title, rawURL string) string {
+	url := strings.TrimSpace(rawURL)
+	if url == "" {
+		return ""
+	}
+	if id := c.ByURL[url]; id != "" {
+		return id
+	}
+	id := fmt.Sprintf("S%d", c.Next)
+	c.Next++
+	c.ByURL[url] = id
+	if title == "" {
+		title = url
+	}
+	c.Sources = append(c.Sources, map[string]string{"id": id, "title": title, "url": url})
+	return id
+}
+
+func compactWebToolResultWithCitations(result []map[string]any, tracker *citationTracker) []map[string]any {
+	out := make([]map[string]any, 0, min(5, len(result)))
+	for _, r := range result {
+		m := map[string]any{}
+		title, _ := r["title"].(string)
+		url, _ := r["url"].(string)
+		if id := tracker.Register(title, url); id != "" {
+			m["source_id"] = id
+		}
+		for _, k := range []string{"title", "snippet", "source", "reader"} {
+			if v, ok := r[k]; ok {				m[k] = v
+			}
+		}
+		if url != "" {
+			m["url"] = url
+		}
+		if txt, ok := r["content"].(string); ok && strings.TrimSpace(txt) != "" {
+			if len(txt) > 3500 {
+				txt = txt[:3500] + "\n[page content truncated by AgentDesk]"
+			}
+			m["content"] = txt
+		}
+		if links, ok := r["links"].([]map[string]string); ok {
+			m["links"] = links[:min(8, len(links))]
+		}
+		out = append(out, m)
+		if len(out) >= 5 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return []map[string]any{{"error": "No readable search results were returned."}}
+	}
+	return out
+}
+
+func isManualContinueRequest(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	t = strings.Trim(t, "\"'` .!?,;:")
+	switch t {
+	case "continue", "please continue", "keep going", "go on", "continue please", "continue the answer", "continue the response":
+		return true
+	default:
+		return false
+	}
+}
+
+func prepareManualContinuationMessages(raw []map[string]any, pos *GeoPosition) ([]map[string]any, bool) {
+	if len(raw) < 2 || !isManualContinueRequest(extractLastUserText(raw)) {
+		return withMemory(augmentLiveContext(raw, pos)), false
+	}
+	// Drop the user's manual "continue" message and replace it with a hidden continuation
+	// instruction after the most recent assistant content. This prevents the model from
+	// treating "continue" as a new report request and restarting with a Summary/Title.
+	base := append([]map[string]any(nil), raw[:len(raw)-1]...)
+	msgs := withMemory(augmentLiveContext(base, pos))
+	msgs = append(msgs, map[string]any{"role": "user", "content": "[AgentDesk internal continuation instruction — hidden from the user] Continue immediately from the exact point where the previous assistant response ended. Do not restart, summarize, add a title, or write a 'continued' heading. Return only the next text necessary. Do not repeat prior text. If code was cut off, continue the code exactly. If a research report was cut off, continue the same report from its last unfinished section. Do not emit a Sources/References section or raw URLs."})
+	return msgs, true
+}
+
+func chatStream(w http.ResponseWriter, r *http.Request) {
+	var req ChatReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	p, e := providerByID(req.Provider)
+	if e != nil {
+		http.Error(w, e.Error(), 404)
+		return
+	}
+	if strings.TrimSpace(req.Model) != "" {
+		p.Model = strings.TrimSpace(req.Model)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "stream unsupported", 500)
+		return
+	}
+	send := func(v any) { fmt.Fprintf(w, "data: %s\n\n", mustJSON(v)); fl.Flush() }
+	messages := withMemory(augmentLiveContext(req.Messages, req.Location))
+	if hasImageAttachments(req.Messages) && !modelSupportsVision(p) {
+		paths := unsupportedImagePaths(req.Messages)
+		messages = replaceUnsupportedImages(messages, req.AllowTerminal)
+		msg := "Vision is unavailable for this model. "
+		if req.AllowTerminal {
+			msg += "Use the exact local image path below with Terminal to decode or inspect it. Do not infer the image from its filename."
+		} else {
+			msg += "Enable Terminal so AgentDesk can inspect the local image path with a command-line decoder. Do not infer the image from its filename."
+		}
+		if len(paths) > 0 {
+			msg += "\nPaths: " + strings.Join(paths, "\n")
+		}
+		send(map[string]any{"type": "notice", "text": msg})
+	}
+	if req.AllowTerminal {
+		d := terminalDetails()
+		messages = append([]map[string]any{{"role": "system", "content": fmt.Sprintf("Local terminal available. OS: %v. Shell: %v. Default working directory: %v. Only run terminal commands when useful and avoid destructive commands unless explicitly requested.", d["display"], d["shell"], d["cwd"])}}, messages...)
+	}
+	lastUser := extractLastUserText(req.Messages)
+	useAgent := req.Agent || req.Research || looksLikeWebRequest(lastUser) || isWeatherQuery(lastUser) || isMarketQuery(lastUser)
+	if isMarketQuery(lastUser) {
+		if market, err := marketDataForQuery(lastUser); err == nil {
+			send(map[string]any{"type": "market", "data": market})
+			if sourceURL, _ := market["sourceURL"].(string); sourceURL != "" {
+				title, _ := market["name"].(string)
+				send(map[string]any{"type": "sources", "sources": []map[string]string{{"title": title, "url": sourceURL}}})
+			}
+			title, _ := market["name"].(string)
+			messages = append([]map[string]any{{"role": "system", "content": fmt.Sprintf("Live market data retrieved by AgentDesk from Yahoo Finance for %s. Use it as factual market data. Do not invent missing metrics. Do not provide investment instructions or predictions.\n%s", title, mustJSON(market))}}, messages...)
+		}
+	}
+	if req.Research {
+		messages = append([]map[string]any{{"role": "system", "content": "Research mode is a preference, not a mandate. Use web_search only when current/live information, source verification, or information outside your reliable knowledge is needed. Do NOT search for routine coding or explanations you already know. In normal chat Research mode, use no more than five web_search calls. Deep Research has a separate larger research budget. When browsing, read actual page contents and use compact [S#] citations; never add a bibliography or raw URL list."}}, messages...)
+	}
+	if !useAgent {
+		if err := streamFinal(w, p, messages, req.MaxNewTok); err != nil {
+			send(map[string]string{"type": "error", "error": formatProviderError(err)})
+		}
+		return
+	}
+	tracker := newCitationTracker()
+	messages = append([]map[string]any{sourceSystemInstruction()}, messages...)
+	tools := agentToolsForProvider(p, req.AllowTerminal, shouldOfferWebTools(lastUser, req.Research))
+	webSearchCalls := 0
+	const maxRegularWebSearches = 5
+	for round := 0; round < 20; round++ {
+		msg, _, _, err := streamJSONResponse(w, p, messages, tools, req.MaxNewTok, func(txt string) {
+			send(map[string]string{"type": "chunk", "text": txt})
+		})
+		if err != nil {
+			send(map[string]string{"type": "error", "error": formatProviderError(err)})
+			return
+		}
+		if msg == nil {
+			send(map[string]string{"type": "error", "error": "provider returned no choices"})
+			return
+		}
+		calls, _ := msg["tool_calls"].([]any)
+		content := messageText(msg["content"])
+		if len(calls) == 0 {
+			if strings.TrimSpace(content) != "" {
+				send(map[string]any{"type": "chunk", "text": content})
+				break
+			}
+			if round < 2 {
+				messages = append(messages, msg, map[string]any{"role": "user", "content": "[AgentDesk internal instruction] Return the actual user-facing answer now. Do not call tools. Do not describe internal state."})
+				continue
+			}
+			send(map[string]string{"type": "error", "error": "Model returned no visible text."})
+			return
+		}
+		messages = append(messages, msg)
+		for _, raw := range calls {
+			call, _ := raw.(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			args, _ := fn["arguments"].(string)
+			id, _ := call["id"].(string)
+			var result any
+			switch name {
+			case "web_search":
+				var a struct {
+					Query string `json:"query"`
+				}
+				_ = json.Unmarshal([]byte(args), &a)
+				if webSearchCalls >= maxRegularWebSearches {
+					send(map[string]string{"type": "tool", "text": fmt.Sprintf("Web search limit reached (%d/%d)", maxRegularWebSearches, maxRegularWebSearches)})
+					result = map[string]any{"error": fmt.Sprintf("Regular chat search limit reached at %d searches. Use existing evidence or answer from context.", maxRegularWebSearches)}
+					break
+				}
+				webSearchCalls++
+				send(map[string]string{"type": "tool", "text": fmt.Sprintf("Searching %d/%d: %s", webSearchCalls, maxRegularWebSearches, a.Query)})
+				rows := runSearchWithLocation(a.Query, req.Location)
+				for _, rr := range rows {
+					t, _ := rr["title"].(string)
+					u, _ := rr["url"].(string)
+					if strings.TrimSpace(u) != "" {
+						tracker.Register(t, u)
+					}
+				}
+				if len(tracker.Sources) > 0 {
+					send(map[string]any{"type": "sources", "sources": tracker.Sources})
+				}
+				result = compactWebToolResultWithCitations(rows, tracker)
+			case "open_url":
+				var a struct {
+					URL string `json:"url"`
+				}
+				_ = json.Unmarshal([]byte(args), &a)
+				send(map[string]string{"type": "tool", "text": "Reading: " + a.URL})
+				page := fetchPage(a.URL)
+				title, _ := page["title"].(string)
+				tracker.Register(title, a.URL)
+				send(map[string]any{"type": "sources", "sources": tracker.Sources})
+				result = page
+			case "terminal_run":
+				var a TerminalReq
+				_ = json.Unmarshal([]byte(args), &a)
+				terminalLabel := "Terminal: " + strings.TrimSpace(a.Command)
+				if strings.TrimSpace(a.CWD) != "" {
+					terminalLabel += "  [" + strings.TrimSpace(a.CWD) + "]"
+				}
+				send(map[string]string{"type": "tool", "text": terminalLabel})
+				if req.AllowTerminal {
+					result = runTerminalCommand(a)
+				} else {
+					result = map[string]any{"ok": false, "error": "Terminal access is not enabled for this chat."}
+				}
+			default:
+				localResult, label, localErr := executeAgentLocalTool(name, args, req.AllowTerminal)
+				if localErr != nil {
+					result = map[string]any{"ok": false, "error": localErr.Error()}
+				} else {
+					result = localResult
+				}
+				if label != "" {
+					send(map[string]string{"type": "tool", "text": label})
+				}
+			}
+			rb, _ := json.Marshal(result)
+			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": id, "content": string(rb)})
+		}
+	}
+	if len(tracker.Sources) > 0 {
+		send(map[string]any{"type": "sources", "sources": tracker.Sources})
+	}
+	send(map[string]string{"type": "done"})
+}
+
+func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+func modelMaxCompletionTokens(p Provider) int {
+	base := normalizeProviderBase(p.BaseURL)
+	model := strings.TrimSpace(p.Model)
+	if base == "" || model == "" {
+		return 0
+	}
+	req, err := http.NewRequest("GET", base+"/models", nil)
+	if err != nil {
+		return 0
+	}
+	if strings.TrimSpace(p.APIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion)
+	resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return 0
+	}
+	objects, err := extractModelObjects(body)
+	if err != nil {
+		return 0
+	}
+	for _, obj := range objects {
+		id, _ := obj["id"].(string)
+		if !strings.EqualFold(strings.TrimSpace(id), model) {
+			continue
+		}
+		for _, key := range []string{"max_completion_tokens", "max_output_tokens", "max_tokens"} {
+			switch v := obj[key].(type) {
+			case float64:
+				if v > 0 {
+					return int(v)
+				}
+			case int:
+				if v > 0 {
+					return v
+				}
+			case json.Number:
+				if n, err := strconv.Atoi(string(v)); err == nil && n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func deepResearchPlanQueries(q string, target int) []string {
+	base := strings.TrimSpace(q)
+	if target <= 0 || base == "" {
+		return nil
+	}
+	angles := []string{
+		"official documentation", "official specification", "official repository", "official release notes", "official API reference",
+		"primary sources", "standards", "RFC", "technical details", "architecture", "implementation details", "how it works",
+		"real world examples", "case study", "production usage", "deployment guide", "configuration", "integration guide", "migration guide",
+		"compatibility", "interoperability", "limitations", "known issues", "common failures", "troubleshooting", "edge cases",
+		"benchmarks", "independent benchmark", "performance measurements", "latency", "throughput", "resource usage", "scaling",
+		"pricing", "cost", "rate limits", "quotas", "free tier", "enterprise pricing", "usage limits",
+		"security", "authentication", "authorization", "privacy", "threat model", "vulnerabilities", "CVE", "OWASP",
+		"recent changes", "latest update", "new features", "breaking changes", "deprecations", "2026", "2025", "this month",
+		"user reported issues", "developer discussion", "maintainer discussion", "GitHub issues", "GitHub discussions", "community experience",
+		"comparison", "alternatives", "competitors", "tradeoffs", "pros and cons", "best practices", "recommended configuration",
+		"example code", "Python example", "JavaScript example", "TypeScript example", "Go example", "CLI example", "REST API example",
+		"documentation tutorial", "quickstart", "reference implementation", "sample project", "open source implementation", "test suite",
+		"backward compatibility", "version compatibility", "protocol compatibility", "client compatibility", "server compatibility", "multi-provider support",
+		"failure analysis", "incident report", "postmortem", "bug report", "performance regression", "benchmark methodology", "measurement methodology",
+		"expert analysis", "academic paper", "industry analysis", "technical blog", "conference talk", "engineering writeup", "design document",
+	}
+	qualifiers := []string{"site:github.com", "site:docs", "site:readthedocs.io", "2026", "2025", "latest", "official"}
+	out := make([]string, 0, target)
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		key := strings.ToLower(s)
+		if s == "" || seen[key] || len(out) >= target {
+			return
+		}
+		seen[key] = true
+		out = append(out, s)
+	}
+	add(base)
+	for _, angle := range angles {
+		add(base + " " + angle)
+	}
+	for _, qualifier := range qualifiers {
+		for _, angle := range angles {
+			add(base + " " + angle + " " + qualifier)
+			if len(out) >= target {
+				return out
+			}
+		}
+	}
+	for pass := 2; len(out) < target; pass++ {
+		for _, angle := range angles {
+			add(fmt.Sprintf("%s %s research pass %d", base, angle, pass))
+			if len(out) >= target {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func deepResearchBudget(p Provider, requested int) (effective, reportReserve, searchBudget, searchPasses, modelMax int) {
+	configured := requested
+	if configured <= 0 {
+		configured = p.MaxNewTok
+	}
+	if configured <= 0 {
+		configured = 8192
+	}
+	modelMax = modelMaxCompletionTokens(p)
+	effective = configured
+	if modelMax > 0 && modelMax < effective {
+		effective = modelMax
+	}
+	if effective <= 0 {
+		effective = 8192
+	}
+	if effective >= 48000 {
+		reportReserve = 5000
+	} else {
+		reportReserve = 4000
+	}
+	if effective < reportReserve+512 {
+		reportReserve = max(1024, effective/2)
+	}
+	searchBudget = max(0, effective-reportReserve)
+	// Policy unit: reserve roughly 500 output-token-equivalents per deep-research search pass.
+	// This scales research breadth with the model's usable output budget while keeping a
+	// fixed 4k–5k generation reserve for the final report.
+	searchPasses = searchBudget / 500
+	if searchBudget > 0 && searchPasses < 1 {
+		searchPasses = 1
+	}
+	if searchPasses > 250 {
+		searchPasses = 250
+	}
+	return
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func deepResearchWithLocation(p Provider, q string, requestedMax int, pos *GeoPosition, send func(map[string]any)) (string, []map[string]string, error) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return "", nil, fmt.Errorf("empty research query")
+	}
+	effective, reportReserve, searchBudget, searchPasses, modelMax := deepResearchBudget(p, requestedMax)
+	if send != nil {
+		modelLabel := "unknown"
+		if modelMax > 0 {
+			modelLabel = strconv.Itoa(modelMax)
+		}
+		send(map[string]any{"type": "progress", "text": fmt.Sprintf("Deep Research budget: model max %s, usable %d tokens; reserving %d for final report; search budget %d (~%d search passes)", modelLabel, effective, reportReserve, searchBudget, searchPasses)})
+	}
+	if searchPasses <= 0 {
+		return "", nil, fmt.Errorf("deep research budget is too small after reserving tokens for the final report")
+	}
+	queries := deepResearchPlanQueries(q, searchPasses)
+
+	var corpus []string
+	var sources []map[string]string
+	seenURLs := map[string]bool{}
+	researchCitations := newCitationTracker()
+	pagesPerSearch := 3
+	if searchPasses > 75 {
+		pagesPerSearch = 2
+	}
+	if searchPasses > 150 {
+		pagesPerSearch = 1
+	}
+	corpusCharBudget := min(250000, max(80000, 25000+effective*4))
+	for i, qq := range queries {
+		send(map[string]any{"type": "progress", "text": fmt.Sprintf("Search %d/%d: %s", i+1, len(queries), qq)})
+		rs := runSearchWithLocation(qq, pos)
+		for _, r := range rs[:min(pagesPerSearch, len(rs))] {
+			title, _ := r["title"].(string)
+			rurl, _ := r["url"].(string)
+			snip, _ := r["snippet"].(string)
+			sourceID := researchCitations.Register(title, rurl)
+			if rurl != "" && !seenURLs[rurl] {
+				seenURLs[rurl] = true
+				sources = append(sources, map[string]string{"id": sourceID, "title": title, "url": rurl, "snippet": snip})
+			}
+			content, _ := r["content"].(string)
+			if content == "" && rurl != "" {
+				page := fetchPage(rurl)
+				content, _ = page["text"].(string)
+			}
+			if len(content) > 4500 {
+				content = content[:4500] + "\n[page content truncated by AgentDesk]"
+			}
+			if title == "" {
+				title = rurl
+			}
+			if rurl != "" || content != "" {
+				corpus = append(corpus, fmt.Sprintf("SOURCE %s: %s\nSNIPPET: %s\nPAGE CONTENT: %s", sourceID, title, snip, content))
+			}
+		}
+	}
+	joined := strings.Join(corpus, "\n\n")
+	if len(joined) > corpusCharBudget {
+		joined = joined[:corpusCharBudget] + "\n[research evidence truncated by AgentDesk]"
+	}
+
+	if joined == "" {
+		return "", sources, fmt.Errorf("web research returned no readable page content. Check internet access or try again")
+	}
+
+	send(map[string]any{"type": "progress", "text": "Synthesizing the research report…"})
+	prompt := "Research question: " + q + "\n\nCollected web evidence:\n" + joined
+	finalMsgs := withMemory([]map[string]any{
+		{"role": "system", "content": "You are a careful research synthesizer. Produce a useful report with Summary, Findings, Uncertainties, and (when helpful) next steps. Attribute factual claims compactly using only source IDs like [S1] and [S2] when needed. The desktop UI displays the full source titles and URLs separately, so NEVER write a Sources/References/Bibliography section, NEVER repeat raw URLs, and NEVER emit a long citation list. Prefer at most one [S#] citation per paragraph and no more than 12 citations total unless the user explicitly asks for exhaustive attribution. Do not spend output budget on source metadata. Do not invent facts or source IDs. Current date: " + time.Now().Format("January 2, 2006")},
+		{"role": "user", "content": prompt},
+	})
+	res, e := doJSON(p, finalMsgs, nil, reportReserve)
+	if e != nil {
+		// Return usable research evidence instead of turning a synthesis failure into
+		// a generic network error. The UI can still show the gathered sources.
+		raw := "## Research evidence\n\n" + joined
+		return raw, sources, nil
+	}
+	cc, _ := res["choices"].([]any)
+	if len(cc) == 0 {
+		return "", sources, fmt.Errorf("provider returned no synthesis choices")
+	}
+	cm, _ := cc[0].(map[string]any)
+	cmsg, _ := cm["message"].(map[string]any)
+	ans, _ := cmsg["content"].(string)
+	if strings.TrimSpace(ans) == "" {
+		return "", sources, fmt.Errorf("provider returned an empty synthesis response")
+	}
+	return ans, sources, nil
+}
+
+func deepResearch(p Provider, q string, max int, send func(map[string]any)) (string, []map[string]string, error) {
+	return deepResearchWithLocation(p, q, max, nil, send)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func conversations(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		list := loadConversations()
+		if id != "" {
+			for _, c := range list {
+				if c.ID == id {
+					jsonResp(w, c)
+					return
+				}
+			}
+			http.Error(w, "conversation not found", http.StatusNotFound)
+			return
+		}
+		jsonResp(w, list)
+	case "POST":
+		var c Conversation
+		if readJSON(r, &c) != nil {
+			http.Error(w, "invalid", 400)
+			return
+		}
+		if c.ID == "" {
+			c.ID = strconv.FormatInt(time.Now().UnixNano(), 10)
+		}
+		if c.Folder == "" {
+			c.Folder = "General"
+		}
+		c.Updated = time.Now().Format(time.RFC3339)
+		list := loadConversations()
+		replaced := false
+		for i := range list {
+			if list[i].ID == c.ID {
+				list[i] = c
+				replaced = true
+			}
+		}
+		if !replaced {
+			list = append([]Conversation{c}, list...)
+		}
+		_ = saveConversations(list)
+		jsonResp(w, c)
+	case "DELETE":
+		id := r.URL.Query().Get("id")
+		list := loadConversations()
+		out := list[:0]
+		for _, c := range list {
+			if c.ID != id {
+				out = append(out, c)
+			}
+		}
+		_ = saveConversations(out)
+		jsonResp(w, map[string]bool{"ok": true})
+	}
+}
+
+func memory(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		jsonResp(w, loadMem())
+	case "POST":
+		var x Memory
+		if readJSON(r, &x) != nil || strings.TrimSpace(x.Text) == "" {
+			http.Error(w, "invalid memory", 400)
+			return
+		}
+		x.ID = strconv.FormatInt(time.Now().UnixNano(), 10)
+		if x.Kind == "" {
+			x.Kind = "note"
+		}
+		x.Created = time.Now().Format(time.RFC3339)
+		m := loadMem()
+		m = append(m, x)
+		_ = saveMem(m)
+		jsonResp(w, x)
+	case "DELETE":
+		id := r.URL.Query().Get("id")
+		m := loadMem()
+		out := m[:0]
+		for _, x := range m {
+			if x.ID != id {
+				out = append(out, x)
+			}
+		}
+		_ = saveMem(out)
+		jsonResp(w, map[string]bool{"ok": true})
+	}
+}
+
+func config(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		c := loadConfig()
+		clean := make([]Provider, 0, len(c.Providers))
+		seen := map[string]bool{}
+		for _, p := range c.Providers {
+			p.ID = strings.TrimSpace(p.ID)
+			if p.ID == "" || seen[p.ID] {
+				continue
+			}
+			seen[p.ID] = true
+			p.Name = strings.TrimSpace(p.Name)
+			p.BaseURL = normalizeProviderBase(p.BaseURL)
+			p.Model = strings.TrimSpace(p.Model)
+			if p.MaxNewTok <= 0 {
+				p.MaxNewTok = 4096
+			}
+			seenModels := map[string]bool{}
+			models := make([]string, 0, len(p.Models)+1)
+			for _, m := range p.Models {
+				m = strings.TrimSpace(m)
+				if m != "" && !seenModels[m] {
+					seenModels[m] = true
+					models = append(models, m)
+				}
+			}
+			if p.Model != "" && !seenModels[p.Model] {
+				models = append(models, p.Model)
+			}
+			p.Models = models
+			p.HasAPIKey = p.APIKey != ""
+			// Redact only the response. NEVER persist this redacted copy back to disk.
+			p.APIKey = ""
+			clean = append(clean, p)
+		}
+		jsonResp(w, Config{Providers: clean})
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var incoming Config
+	if readJSON(r, &incoming) != nil {
+		http.Error(w, "invalid", 400)
+		return
+	}
+	old := loadConfig()
+	oldByID := map[string]Provider{}
+	for _, p := range old.Providers {
+		oldByID[p.ID] = p
+	}
+	seen := map[string]bool{}
+	clean := make([]Provider, 0, len(incoming.Providers))
+	for i, p := range incoming.Providers {
+		p.ID = strings.TrimSpace(p.ID)
+		if p.ID == "" {
+			p.ID = fmt.Sprintf("provider-%d-%d", time.Now().UnixNano(), i)
+		}
+		if seen[p.ID] {
+			p.ID = fmt.Sprintf("%s-%d", p.ID, i)
+		}
+		seen[p.ID] = true
+		p.Name = strings.TrimSpace(p.Name)
+		p.BaseURL = normalizeProviderBase(p.BaseURL)
+		p.Model = strings.TrimSpace(p.Model)
+		if p.MaxNewTok <= 0 {
+			p.MaxNewTok = 4096
+		}
+		if p.APIKey == "__KEEP_SAVED__" || strings.TrimSpace(p.APIKey) == "" {
+			if prev, ok := oldByID[p.ID]; ok {
+				p.APIKey = prev.APIKey
+			}
+		}
+		modelSeen := map[string]bool{}
+		cleanModels := make([]string, 0, len(p.Models)+1)
+		for _, m := range p.Models {
+			m = strings.TrimSpace(m)
+			if m != "" && !modelSeen[m] {
+				modelSeen[m] = true
+				cleanModels = append(cleanModels, m)
+			}
+		}
+		if p.Model != "" && !modelSeen[p.Model] {
+			cleanModels = append(cleanModels, p.Model)
+		}
+		if len(cleanModels) == 0 {
+			if oldP, ok := oldByID[p.ID]; ok {
+				for _, m := range oldP.Models {
+					m = strings.TrimSpace(m)
+					if m != "" && !modelSeen[m] {
+						modelSeen[m] = true
+						cleanModels = append(cleanModels, m)
+					}
+				}
+			}
+		}
+		p.Models = cleanModels
+		// Keep a provider record even when BaseURL/Model is temporarily blank.
+		// This makes Add Provider editable before model discovery is complete.
+		if p.Name == "" && p.BaseURL == "" && p.Model == "" && p.APIKey == "" && len(p.Models) == 0 {
+			continue
+		}
+		clean = append(clean, p)
+	}
+	if len(clean) == 0 {
+		http.Error(w, "at least one provider is required", 400)
+		return
+	}
+	if err := saveConfig(Config{Providers: clean}); err != nil {
+		http.Error(w, "save failed: "+err.Error(), 500)
+		return
+	}
+	jsonResp(w, map[string]any{"ok": true, "providerCount": len(clean)})
+}
+
+func isAboveHost(raw string) bool {
+	u, err := url.Parse(normalizeProviderBase(raw))
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "api.above.dev" || h == "above.dev"
+}
+
+func extractModelObjects(body []byte) ([]map[string]any, error) {
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, err
+	}
+	data, _ := env["data"].([]any)
+	if data == nil {
+		data, _ = env["models"].([]any)
+	}
+	out := make([]map[string]any, 0, len(data))
+	for _, raw := range data {
+		if m, ok := raw.(map[string]any); ok {
+			if id, _ := m["id"].(string); strings.TrimSpace(id) != "" {
+				out = append(out, m)
+			}
+		} else if str, ok := raw.(string); ok && strings.TrimSpace(str) != "" {
+			out = append(out, map[string]any{"id": strings.TrimSpace(str)})
+		}
+	}
+	return out, nil
+}
+
+func probeModelAccess(baseURL, apiKey, model string) (bool, error) {
+	payload := map[string]any{"model": model, "messages": []map[string]any{{"role": "user", "content": "OK"}}, "max_tokens": 1}
+	b, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", normalizeProviderBase(baseURL)+"/chat/completions", bytes.NewReader(b))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true, nil
+	}
+	body := strings.ToLower(string(data))
+	if resp.StatusCode == 403 && strings.Contains(body, "model_not_allowed_for_key") {
+		return false, nil
+	}
+	if resp.StatusCode == 401 {
+		return false, fmt.Errorf("unauthorized API key")
+	}
+	if resp.StatusCode == 402 {
+		// The model is recognized by the account, but billing is unavailable.
+		return true, nil
+	}
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		// Don't incorrectly hide a model because of a transient quota/provider failure.
+		return true, nil
+	}
+	if resp.StatusCode == 404 || (resp.StatusCode == 400 && strings.Contains(body, "model")) {
+		return false, nil
+	}
+	return false, nil
+}
+
+func filterAboveModels(baseURL, apiKey string, objects []map[string]any) ([]map[string]any, error) {
+	if !isAboveHost(baseURL) || strings.TrimSpace(apiKey) == "" {
+		return objects, nil
+	}
+	if len(objects) == 0 {
+		return objects, nil
+	}
+	// above.dev currently exposes a public catalog larger than the model subset
+	// available to free/restricted keys. Probe the small catalog so the UI shows
+	// only models that the current key can actually call.
+	type result struct {
+		idx int
+		ok  bool
+		err error
+	}
+	jobs := make(chan int)
+	results := make(chan result, len(objects))
+	var wg sync.WaitGroup
+	workers := 4
+	if len(objects) < workers {
+		workers = len(objects)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				id, _ := objects[idx]["id"].(string)
+				ok, err := probeModelAccess(baseURL, apiKey, id)
+				results <- result{idx: idx, ok: ok, err: err}
+			}
+		}()
+	}
+	go func() {
+		for i := range objects {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	allowed := make(map[int]bool, len(objects))
+	var firstErr error
+	for r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.err == nil && r.ok {
+			allowed[r.idx] = true
+		}
+	}
+	if firstErr != nil && len(allowed) == 0 {
+		return nil, firstErr
+	}
+	filtered := make([]map[string]any, 0, len(allowed))
+	for i, obj := range objects {
+		if allowed[i] {
+			filtered = append(filtered, obj)
+		}
+	}
+	return filtered, nil
+}
+
+func modelsDraft(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req TestProviderReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	base := normalizeProviderBase(req.BaseURL)
+	if base == "" {
+		http.Error(w, "Base URL is required", 400)
+		return
+	}
+	apiKey := strings.TrimSpace(req.APIKey)
+	if (apiKey == "" || apiKey == "__KEEP_SAVED__") && strings.TrimSpace(req.ID) != "" {
+		if saved, err := providerByID(req.ID); err == nil {
+			apiKey = saved.APIKey
+		}
+	}
+	if apiKey == "" && isAboveHost(base) {
+		http.Error(w, "API key is required for above.dev model discovery", 401)
+		return
+	}
+	q, err := http.NewRequest("GET", base+"/models", nil)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if apiKey != "" {
+		q.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(q)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 400 {
+		http.Error(w, string(body), resp.StatusCode)
+		return
+	}
+	if isAboveHost(base) {
+		objects, err := extractModelObjects(body)
+		if err != nil {
+			http.Error(w, "invalid model catalog: "+err.Error(), 502)
+			return
+		}
+		filtered, err := filterAboveModels(base, apiKey, objects)
+		if err != nil {
+			http.Error(w, err.Error(), 502)
+			return
+		}
+		out := map[string]any{"object": "list", "data": filtered}
+		jsonResp(w, out)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+}
+
+func testProvider(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req TestProviderReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	p := Provider{ID: req.ID, Name: req.Name, BaseURL: normalizeProviderBase(req.BaseURL), APIKey: strings.TrimSpace(req.APIKey), Model: strings.TrimSpace(req.Model), MaxNewTok: req.MaxNewTok}
+	if p.ID != "" && (p.APIKey == "" || p.APIKey == "__KEEP_SAVED__") {
+		if saved, err := providerByID(p.ID); err == nil {
+			p.APIKey = saved.APIKey
+		}
+	}
+	if p.BaseURL == "" || p.Model == "" {
+		http.Error(w, "Base URL and Model are required", 400)
+		return
+	}
+	// Use a tiny completion request so providers that don't expose /models can still be tested.
+	content, err := chatWithTools(p, []map[string]any{{"role": "user", "content": "Reply with exactly: OK"}}, false, 64, nil, false)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	jsonResp(w, map[string]any{"ok": true, "content": content})
+}
+
+func models(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("provider")
+	p, e := providerByID(id)
+	if e != nil {
+		http.Error(w, e.Error(), 404)
+		return
+	}
+	req, _ := http.NewRequest("GET", normalizeProviderBase(p.BaseURL)+"/models", nil)
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	resp, e := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if e != nil {
+		http.Error(w, e.Error(), 502)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		d, _ := io.ReadAll(resp.Body)
+		http.Error(w, string(d), resp.StatusCode)
+		return
+	}
+	io.Copy(w, resp.Body)
+}
+
+func makeUploadID(name string, b []byte) string {
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte{0})
+	h.Write(b)
+	h.Write([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func imageDataURLFromUpload(root, id, mimeType string) (string, error) {
+	id = filepath.Base(strings.TrimSpace(id))
+	if id == "" || id == "." || strings.Contains(id, string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid image reference")
+	}
+	matches, err := filepath.Glob(filepath.Join(root, id+".*"))
+	if err != nil || len(matches) == 0 {
+		return "", fmt.Errorf("image upload not found")
+	}
+	b, err := os.ReadFile(matches[0])
+	if err != nil {
+		return "", err
+	}
+	if mimeType == "" || !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		mimeType = http.DetectContentType(b)
+	}
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return "", fmt.Errorf("uploaded file is not an image")
+	}
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(b), nil
+}
+
+func prepareProviderMessages(messages []map[string]any, uploadRoot string) ([]map[string]any, error) {
+	out := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		copyMsg := make(map[string]any, len(msg))
+		for k, v := range msg {
+			copyMsg[k] = v
+		}
+		content, ok := msg["content"]
+		if !ok {
+			out = append(out, copyMsg)
+			continue
+		}
+		parts, ok := content.([]any)
+		if !ok {
+			out = append(out, copyMsg)
+			continue
+		}
+		newParts := make([]any, 0, len(parts))
+		for _, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				newParts = append(newParts, raw)
+				continue
+			}
+			ptype, _ := part["type"].(string)
+			if ptype == "file_ref" {
+				continue
+			}
+			if ptype != "image_ref" {
+				newParts = append(newParts, part)
+				continue
+			}
+			ref, _ := part["image_ref"].(map[string]any)
+			id, _ := ref["id"].(string)
+			mimeType, _ := ref["mime"].(string)
+			dataURL, err := imageDataURLFromUpload(uploadRoot, id, mimeType)
+			if err != nil {
+				return nil, fmt.Errorf("could not load attached image: %w", err)
+			}
+			newParts = append(newParts, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": dataURL, "detail": "high"},
+			})
+		}
+		copyMsg["content"] = newParts
+		out = append(out, copyMsg)
+	}
+	return out, nil
+}
+
+func saveUpload(dir string, header *multipart.FileHeader) (map[string]any, error) {
+	f, e := header.Open()
+	if e != nil {
+		return nil, e
+	}
+	defer f.Close()
+	b, e := io.ReadAll(io.LimitReader(f, 12<<20))
+	if e != nil {
+		return nil, e
+	}
+	name := filepath.Base(header.Filename)
+	_ = os.MkdirAll(dir, 0700)
+	if e != nil {
+		return nil, e
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == "" {
+		ext = ".bin"
+	}
+	if len(ext) > 12 {
+		ext = ".bin"
+	}
+	id := makeUploadID(name, b)
+	p := filepath.Join(dir, id+ext)
+	if e = os.WriteFile(p, b, 0600); e != nil {
+		return nil, e
+	}
+	text := ""
+	switch ext {
+	case ".txt", ".md", ".markdown", ".json", ".csv", ".html", ".css", ".js", ".ts", ".tsx", ".jsx", ".py", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".xml", ".yaml", ".yml", ".toml", ".sql":
+		text = string(b)
+	case ".pdf":
+		text = extractPDFText(b)
+	}
+	if ext == ".xlsx" || ext == ".xls" {
+		text = extractSpreadsheetText(p)
+	}
+	if len(text) > 50000 {
+		text = text[:50000]
+	}
+	mimeType := http.DetectContentType(b)
+	if mimeType == "application/octet-stream" {
+		mimeType = header.Header.Get("Content-Type")
+	}
+	result := map[string]any{"id": id, "name": name, "text": text, "mime": mimeType, "size": len(b), "kind": "file", "path": p, "extension": ext}
+	if strings.HasPrefix(mimeType, "image/") {
+		result["kind"] = "image"
+		// Preview only. Chat messages store an image_ref instead of embedding image bytes.
+		result["dataURL"] = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(b)
+	}
+	return result, nil
+}
+
+func extractPDFText(b []byte) string {
+	var out strings.Builder
+	for _, section := range bytes.Split(b, []byte("BT")) {
+		if i := bytes.Index(section, []byte("ET")); i >= 0 {
+			chunk := section[:i]
+			for len(chunk) > 0 {
+				a := bytes.IndexByte(chunk, '(')
+				if a < 0 {
+					break
+				}
+				chunk = chunk[a+1:]
+				z := bytes.IndexByte(chunk, ')')
+				if z < 0 {
+					break
+				}
+				s := string(chunk[:z])
+				s = strings.ReplaceAll(s, "\\n", " ")
+				s = strings.ReplaceAll(s, "\\(", "(")
+				s = strings.ReplaceAll(s, "\\)", ")")
+				if strings.TrimSpace(s) != "" {
+					out.WriteString(s)
+					out.WriteByte(' ')
+				}
+				chunk = chunk[z+1:]
+			}
+		}
+	}
+	return strings.TrimSpace(out.String())
+}
+func fileDownload(w http.ResponseWriter, r *http.Request) {
+	id := filepath.Base(strings.TrimPrefix(r.URL.Path, "/api/files/"))
+	if id == "" || id == "." || strings.Contains(id, "..") {
+		http.Error(w, "invalid file id", 400)
+		return
+	}
+	matches, _ := filepath.Glob(filepath.Join(dataDir(), "uploads", id+".*"))
+	if len(matches) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, matches[0])
+}
+
+func filesUpload(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(14 << 20); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	fh := r.MultipartForm.File["file"]
+	if len(fh) == 0 {
+		http.Error(w, "missing file", 400)
+		return
+	}
+	result, e := saveUpload(filepath.Join(dataDir(), "uploads"), fh[0])
+	if e != nil {
+		http.Error(w, e.Error(), 500)
+		return
+	}
+	jsonResp(w, result)
+}
+
+func importMemories(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if readJSON(r, &req) != nil || strings.TrimSpace(req.Text) == "" {
+		http.Error(w, "memory import text is required", 400)
+		return
+	}
+	raw := strings.TrimSpace(req.Text)
+	if strings.HasPrefix(raw, "```") {
+		if nl := strings.IndexByte(raw, '\n'); nl >= 0 {
+			raw = strings.TrimSpace(raw[nl+1:])
+			if end := strings.LastIndex(raw, "```"); end >= 0 {
+				raw = strings.TrimSpace(raw[:end])
+			}
+		}
+	}
+	type imported struct {
+		Text string `json:"text"`
+		Kind string `json:"kind"`
+	}
+	items := []imported{}
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		var obj struct {
+			Memories []imported `json:"memories"`
+		}
+		if err2 := json.Unmarshal([]byte(raw), &obj); err2 == nil {
+			items = obj.Memories
+		}
+	}
+	if len(items) == 0 {
+		items = []imported{{Text: raw, Kind: "imported"}}
+	}
+	m := loadMem()
+	added := 0
+	for _, it := range items {
+		if strings.TrimSpace(it.Text) == "" {
+			continue
+		}
+		k := strings.TrimSpace(it.Kind)
+		if k == "" {
+			k = "imported"
+		}
+		m = append(m, Memory{ID: strconv.FormatInt(time.Now().UnixNano(), 10) + fmt.Sprintf("-%d", added), Text: strings.TrimSpace(it.Text), Kind: k, Created: time.Now().Format(time.RFC3339)})
+		added++
+	}
+	if added == 0 {
+		http.Error(w, "no usable memories found", 400)
+		return
+	}
+	if err := saveMem(m); err != nil {
+		http.Error(w, "save failed: "+err.Error(), 500)
+		return
+	}
+	jsonResp(w, map[string]any{"ok": true, "added": added})
+}
+
+func runCode(w http.ResponseWriter, r *http.Request) {
+	var req CodeReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid", 400)
+		return
+	}
+	code := req.Code
+	if len(code) > 200000 {
+		http.Error(w, "code too large", 400)
+		return
+	}
+	dir := filepath.Join(dataDir(), "runs")
+	_ = os.MkdirAll(dir, 0700)
+	ext := ".txt"
+	var cmd *exec.Cmd
+	switch strings.ToLower(req.Language) {
+	case "python", "py":
+		ext = ".py"
+		cmd = exec.Command("python", "")
+	case "javascript", "js", "node":
+		ext = ".js"
+		cmd = exec.Command("node", "")
+	case "go", "golang":
+		ext = ".go"
+		cmd = exec.Command("go", "run", "")
+	default:
+		http.Error(w, "Supported languages: Python, JavaScript/Node, Go", 400)
+		return
+	}
+	file := filepath.Join(dir, fmt.Sprintf("run-%d%s", time.Now().UnixNano(), ext))
+	if err := os.WriteFile(file, []byte(code), 0600); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if ext == ".py" {
+		cmd = exec.Command("python", file)
+	} else if ext == ".js" {
+		cmd = exec.Command("node", file)
+	} else {
+		cmd = exec.Command("go", "run", file)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	cmd.Dir = dir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		jsonResp(w, map[string]any{"ok": false, "output": "Execution timed out after 15 seconds."})
+		return
+	}
+	jsonResp(w, map[string]any{"ok": err == nil, "output": out.String()})
+}
+
+func researchStart(w http.ResponseWriter, r *http.Request) {
+	var req ResearchReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	p, e := providerByID(req.Provider)
+	if e != nil {
+		http.Error(w, e.Error(), 404)
+		return
+	}
+	if strings.TrimSpace(req.Model) != "" {
+		p.Model = strings.TrimSpace(req.Model)
+	}
+	job := newResearchJob()
+	jsonResp(w, map[string]any{"id": job.ID})
+	go func() {
+		updateResearchJob(job.ID, "running", "Starting research…")
+		ans, sources, err := deepResearchWithLocation(p, req.Query, req.MaxNewTok, req.Location, func(ev map[string]any) {
+			text, _ := ev["text"].(string)
+			if text != "" {
+				updateResearchJob(job.ID, "running", text)
+			}
+		})
+		if err != nil {
+			finishResearchJob(job.ID, "error", "", sources, err)
+			return
+		}
+		finishResearchJob(job.ID, "done", ans, sources, nil)
+	}()
+}
+
+func researchStatus(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	researchMu.Lock()
+	j := researchJobs[id]
+	if j != nil {
+		copyJob := *j
+		copyJob.Progress = append([]string(nil), j.Progress...)
+		copyJob.Sources = append([]map[string]string(nil), j.Sources...)
+		researchMu.Unlock()
+		jsonResp(w, copyJob)
+		return
+	}
+	researchMu.Unlock()
+	http.Error(w, "research job not found", 404)
+}
+
+func cleanupResearchJobs() {
+	researchMu.Lock()
+	defer researchMu.Unlock()
+	cutoff := time.Now().Add(-30 * time.Minute)
+	for id, j := range researchJobs {
+		t, err := time.Parse(time.RFC3339, j.UpdatedAt)
+		if err == nil && t.Before(cutoff) {
+			delete(researchJobs, id)
+		}
+	}
+}
+
+func startupServer() string {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/config", config)
+	mux.HandleFunc("/api/memory", memory)
+	mux.HandleFunc("/api/memory/import", importMemories)
+	mux.HandleFunc("/api/conversations", conversations)
+	mux.HandleFunc("/api/models", models)
+	mux.HandleFunc("/api/test-provider", testProvider)
+	mux.HandleFunc("/api/models-draft", modelsDraft)
+	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
+		jsonResp(w, map[string]any{"query": r.URL.Query().Get("q"), "results": runSearch(r.URL.Query().Get("q"))})
+	})
+	mux.HandleFunc("/api/open", func(w http.ResponseWriter, r *http.Request) { jsonResp(w, fetchPage(r.URL.Query().Get("url"))) })
+	mux.HandleFunc("/api/chat", chat)
+	mux.HandleFunc("/api/chat/stream", chatStream)
+	mux.HandleFunc("/api/research/start", researchStart)
+	mux.HandleFunc("/api/research/status", researchStatus)
+	mux.HandleFunc("/api/research", func(w http.ResponseWriter, r *http.Request) {
+		var req ResearchReq
+		if readJSON(r, &req) != nil {
+			http.Error(w, "invalid", 400)
+			return
+		}
+		p, e := providerByID(req.Provider)
+		if e != nil {
+			http.Error(w, e.Error(), 404)
+			return
+		}
+		ans, sources, e := deepResearchWithLocation(p, req.Query, req.MaxNewTok, req.Location, func(map[string]any) {})
+		if e != nil {
+			http.Error(w, e.Error(), 502)
+			return
+		}
+		jsonResp(w, map[string]any{"content": ans, "sources": sources})
+	})
+	mux.HandleFunc("/api/research/stream", func(w http.ResponseWriter, r *http.Request) {
+		var req ResearchReq
+		if readJSON(r, &req) != nil {
+			http.Error(w, "invalid", 400)
+			return
+		}
+		p, e := providerByID(req.Provider)
+		if e != nil {
+			http.Error(w, e.Error(), 404)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "stream unsupported", 500)
+			return
+		}
+		send := func(v map[string]any) { bb, _ := json.Marshal(v); fmt.Fprintf(w, "data: %s\n\n", bb); fl.Flush() }
+		ans, sources, e := deepResearchWithLocation(p, req.Query, req.MaxNewTok, req.Location, send)
+		if e != nil {
+			send(map[string]any{"type": "error", "error": e.Error()})
+			return
+		}
+		send(map[string]any{"type": "result", "content": ans, "sources": sources})
+		send(map[string]any{"type": "done"})
+	})
+	mux.HandleFunc("/api/files/", fileDownload)
+	mux.HandleFunc("/api/files", filesUpload)
+	mux.HandleFunc("/api/run-code", runCode)
+	mux.HandleFunc("/api/terminal-info", terminalInfo)
+	mux.HandleFunc("/api/terminal-run", terminalRun)
+	mux.HandleFunc("/api/artifacts", createArtifacts)
+	mux.HandleFunc("/api/artifacts/", artifactDownload)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		if r.URL.Path != "/" {
+			http.FileServer(http.FS(webFS)).ServeHTTP(w, r)
+			return
+		}
+		f, _ := webFS.ReadFile("web/index.html")
+		t := template.Must(template.New("i").Parse(string(f)))
+		_ = t.Execute(w, nil)
+	})
+	srv := &http.Server{Handler: mux}
+	ln, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		return ""
+	}
+	go srv.Serve(ln)
+	return "http://" + ln.Addr().String()
+}
+
+func browserCandidates() []string {
+	local := os.Getenv("LOCALAPPDATA")
+	programFiles := os.Getenv("PROGRAMFILES")
+	programFilesX86 := os.Getenv("PROGRAMFILES(X86)")
+	candidates := []string{"msedge.exe", "chrome.exe", "brave.exe"}
+	if local != "" {
+		candidates = append(candidates,
+			filepath.Join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+			filepath.Join(local, "Google", "Chrome", "Application", "chrome.exe"),
+			filepath.Join(local, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+		)
+	}
+	for _, root := range []string{programFiles, programFilesX86} {
+		if root == "" {
+			continue
+		}
+		candidates = append(candidates,
+			filepath.Join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+			filepath.Join(root, "Google", "Chrome", "Application", "chrome.exe"),
+			filepath.Join(root, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+		)
+	}
+	return candidates
+}
+
+func openApp(addr string) {
+	time.Sleep(250 * time.Millisecond)
+	if runtime.GOOS == "windows" {
+		profile := filepath.Join(dataDir(), "BrowserProfile")
+		_ = os.MkdirAll(profile, 0700)
+		for _, candidate := range browserCandidates() {
+			exe := candidate
+			if !strings.Contains(candidate, string(filepath.Separator)) {
+				found, e := exec.LookPath(candidate)
+				if e != nil {
+					continue
+				}
+				exe = found
+			} else if _, e := os.Stat(candidate); e != nil {
+				continue
+			}
+			cmd := exec.Command(exe,
+				"--app="+addr,
+				"--start-maximized",
+				"--no-first-run",
+				"--no-default-browser-check",
+				"--disable-session-crashed-bubble",
+				"--disable-features=TranslateUI",
+				"--user-data-dir="+profile,
+			)
+			if err := cmd.Start(); err == nil {
+				return
+			}
+		}
+		// Never silently fall back to an ordinary browser tab. AgentDesk is intended
+		// to open in a dedicated app window.
+		showStartupError("AgentDesk could not find Microsoft Edge, Google Chrome, or Brave. Please install one of these browsers and start AgentDesk again.")
+		return
+	}
+	if err := exec.Command("xdg-open", addr).Start(); err != nil {
+		showStartupError("AgentDesk could not open its desktop window: " + err.Error())
+	}
+}
+
+func showStartupError(msg string) {
+	if runtime.GOOS == "windows" {
+		// rundll32 is used only for an error dialog, never to open the app URL.
+		_ = exec.Command("rundll32", "user32.dll,MessageBoxW", "0", msg, "AgentDesk Startup Error", "0x10").Start()
+	}
+}
+func main() {
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			cleanupResearchJobs()
+		}
+	}()
+	addr := startupServer()
+	if addr == "" {
+		return
+	}
+	openApp(addr)
+	select {}
+}
