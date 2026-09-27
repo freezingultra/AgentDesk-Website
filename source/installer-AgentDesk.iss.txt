@@ -1,0 +1,37 @@
+#define AppName "AgentDesk"
+#define AppVersion "35.0"
+#define AppPublisher "AgentDesk"
+#define AppExeName "AgentDesk.exe"
+#define AppSourceExe "..\release-assets\AgentDesk-v35.exe"
+
+[Setup]
+AppId={{D0B5F8C9-8C3A-4BE9-A0D2-1234567890AB}
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppPublisher={#AppPublisher}
+DefaultDirName={localappdata}\Programs\AgentDesk
+DefaultGroupName=AgentDesk
+OutputDir=..\release-assets
+OutputBaseFilename=AgentDesk-Setup-v35
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+PrivilegesRequired=lowest
+UninstallDisplayIcon={app}\{#AppExeName}
+ChangesAssociations=no
+
+[Files]
+Source: "{#AppSourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE-SOURCE-AVAILABLE.md"; DestDir: "{app}"; DestName: "SOURCE-AVAILABLE-LICENSE.md"; Flags: ignoreversion
+
+[Icons]
+Name: "{userprograms}\AgentDesk"; Filename: "{app}\{#AppExeName}"
+Name: "{userdesktop}\AgentDesk"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
+
+[Run]
+Filename: "{app}\{#AppExeName}"; Description: "Launch AgentDesk"; Flags: nowait postinstall skipifsilent
