@@ -1,0 +1,267 @@
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func localAgentToolDefinitions(allowTerminal bool) []map[string]any {
+	tools := []map[string]any{
+		{"type":"function","function":map[string]any{"name":"system_info","description":"Return AgentDesk OS, shell, app version, home directory and working directory.","parameters":map[string]any{"type":"object","properties":map[string]any{}}}},
+		{"type":"function","function":map[string]any{"name":"memory_search","description":"Search AgentDesk persistent memory across all chats for relevant saved context.","parameters":map[string]any{"type":"object","properties":map[string]any{"query":map[string]any{"type":"string"}},"required":[]string{"query"}}}},
+		{"type":"function","function":map[string]any{"name":"memory_update","description":"Update AgentDesk persistent memory with durable preferences, project context, recurring instructions or useful long-term facts. Never store credentials, secrets, tokens or hidden reasoning.","parameters":map[string]any{"type":"object","properties":map[string]any{"memories":map[string]any{"type":"array","items":map[string]any{"type":"object","properties":map[string]any{"kind":map[string]any{"type":"string"},"text":map[string]any{"type":"string"}},"required":[]string{"text"}}}},"required":[]string{"memories"}}}},
+		{"type":"function","function":map[string]any{"name":"file_read","description":"Read an AgentDesk-uploaded local file or, with Terminal permission, another local text, PDF, XLSX or XLS file. Prefer the exact local path attached by AgentDesk.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"}},"required":[]string{"path"}}}},
+	}
+	if allowTerminal {
+		tools = append(tools,
+			map[string]any{"type":"function","function":map[string]any{"name":"workspace_list","description":"List files and directories in a local workspace.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"}}}}},
+			map[string]any{"type":"function","function":map[string]any{"name":"workspace_search","description":"Search text across files in a local workspace.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"},"query":map[string]any{"type":"string"}},"required":[]string{"query"}}}},
+			map[string]any{"type":"function","function":map[string]any{"name":"file_write","description":"Create or update a text or code file inside the user's home directory.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"},"content":map[string]any{"type":"string"}},"required":[]string{"path","content"}}}},
+			map[string]any{"type":"function","function":map[string]any{"name":"code_run","description":"Run Python, JavaScript/Node or Go code locally and return stdout/stderr.","parameters":map[string]any{"type":"object","properties":map[string]any{"language":map[string]any{"type":"string"},"code":map[string]any{"type":"string"}},"required":[]string{"language","code"}}}},
+		)
+	}
+	return tools
+}
+
+func executeAgentLocalTool(name, args string, allowTerminal bool) (any, string, error) {
+	switch name {
+	case "system_info":
+		return terminalDetails(), "System info", nil
+	case "memory_search":
+		var a struct{ Query string }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid memory_search arguments") }
+		return map[string]any{"memories": memorySearch(a.Query, 8)}, "Memory search: "+a.Query, nil
+	case "memory_update":
+		var a struct{ Memories []struct{ Kind string; Text string } }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid memory_update arguments") }
+		items := make([]Memory, 0, len(a.Memories))
+		for _, x := range a.Memories {
+			if strings.TrimSpace(x.Text) != "" { items = append(items, Memory{Text: strings.TrimSpace(x.Text), Kind: strings.TrimSpace(x.Kind), Source: "agent"}) }
+		}
+		added, updated, skipped, err := upsertMemories(items)
+		if err != nil { return nil, "", err }
+		label := fmt.Sprintf("Memory updated: %d added, %d refreshed", added, updated)
+		if skipped > 0 { label += fmt.Sprintf(" (%d skipped)", skipped) }
+		return map[string]any{"ok":true,"added":added,"updated":updated,"skipped":skipped}, label, nil
+	case "file_read":
+		var a struct{ Path string }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid file_read arguments") }
+		path := strings.Trim(strings.TrimSpace(a.Path), "\"")
+		if path == "" { return nil, "", fmt.Errorf("path is required") }
+		if !allowTerminal && !isUploadedPath(path) { return nil, "", fmt.Errorf("file_read without Terminal is limited to AgentDesk-uploaded files") }
+		out, err := readLocalFile(path)
+		if err != nil { return nil, "", err }
+		return out, "Read file: "+path, nil
+	case "workspace_list":
+		if !allowTerminal { return nil, "", fmt.Errorf("enable Terminal for workspace access") }
+		var a struct{ Path string }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid workspace_list arguments") }
+		path := strings.TrimSpace(a.Path)
+		if path == "" { path, _ = os.UserHomeDir() }
+		entries, err := os.ReadDir(path)
+		if err != nil { return nil, "", err }
+		rows := make([]map[string]any, 0, minInt(len(entries), 200))
+		for i, e := range entries {
+			if i >= 200 { break }
+			row := map[string]any{"name":e.Name(),"directory":e.IsDir()}
+			if info, err := e.Info(); err == nil { row["size"] = info.Size() }
+			rows = append(rows, row)
+		}
+		return map[string]any{"path":path,"entries":rows}, "Listed workspace: "+path, nil
+	case "workspace_search":
+		if !allowTerminal { return nil, "", fmt.Errorf("enable Terminal for workspace search") }
+		var a struct{ Path string; Query string }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid workspace_search arguments") }
+		root := strings.TrimSpace(a.Path)
+		if root == "" { root, _ = os.UserHomeDir() }
+		q := strings.TrimSpace(a.Query)
+		if q == "" { return nil, "", fmt.Errorf("query is required") }
+		return map[string]any{"path":root,"query":q,"results":searchWorkspace(root,q)}, fmt.Sprintf("Workspace search: %q in %s",q,root), nil
+	case "file_write":
+		if !allowTerminal { return nil, "", fmt.Errorf("enable Terminal to write local files") }
+		var a struct{ Path string; Content string }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid file_write arguments") }
+		path, err := secureHomePath(a.Path)
+		if err != nil { return nil, "", err }
+		if len(a.Content) > 2_000_000 { return nil, "", fmt.Errorf("file content is too large") }
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil { return nil, "", err }
+		if err := os.WriteFile(path, []byte(a.Content), 0600); err != nil { return nil, "", err }
+		return map[string]any{"ok":true,"path":path,"bytes":len(a.Content)}, "Wrote file: "+path, nil
+	case "code_run":
+		if !allowTerminal { return nil, "", fmt.Errorf("enable Terminal to run code") }
+		var a struct{ Language string; Code string }
+		if err := json.Unmarshal([]byte(args), &a); err != nil { return nil, "", fmt.Errorf("invalid code_run arguments") }
+		out, err := runLocalCode(a.Language, a.Code)
+		if err != nil { return nil, "", err }
+		return out, "Code run: "+strings.TrimSpace(a.Language), nil
+	default:
+		return nil, "", fmt.Errorf("unknown local agent tool: %s", name)
+	}
+}
+
+func minInt(a,b int) int { if a < b { return a }; return b }
+
+func isUploadedPath(path string) bool {
+	root,_ := filepath.Abs(filepath.Join(dataDir(),"uploads"))
+	p,_ := filepath.Abs(path)
+	rel,err := filepath.Rel(root,p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel,".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+}
+
+func secureHomePath(path string) (string,error) {
+	home,err := os.UserHomeDir(); if err != nil { return "",err }
+	if strings.TrimSpace(path) == "" { return "",fmt.Errorf("path is required") }
+	abs,err := filepath.Abs(path); if err != nil { return "",err }
+	rel,err := filepath.Rel(home,abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel,".."+string(os.PathSeparator)) || filepath.IsAbs(rel) { return "",fmt.Errorf("file_write is restricted to the user's home directory") }
+	return abs,nil
+}
+
+func readLocalFile(path string) (map[string]any,error) {
+	info,err := os.Stat(path); if err != nil { return nil,err }
+	if !info.Mode().IsRegular() { return nil,fmt.Errorf("path is not a regular file") }
+	b,err := os.ReadFile(path); if err != nil { return nil,err }
+	mimeType := mimeTypeForPath(path,b)
+	result := map[string]any{"path":path,"name":filepath.Base(path),"size":len(b),"mime":mimeType}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".txt",".md",".markdown",".json",".csv",".html",".css",".js",".ts",".tsx",".jsx",".py",".go",".rs",".java",".c",".cpp",".h",".hpp",".xml",".yaml",".yml",".toml",".sql",".sh",".bash",".log":
+		result["text"] = truncateText(string(b),50000)
+	case ".pdf":
+		result["text"] = truncateText(extractPDFText(b),50000)
+	case ".xlsx",".xls":
+		text := extractSpreadsheetText(path)
+		if text != "" { result["text"] = truncateText(text,50000) } else { result["error"] = "Spreadsheet extraction is unavailable on this machine; use Terminal with a spreadsheet decoder on the exact path." }
+	default:
+		if strings.HasPrefix(mimeType,"image/") { result["text"] = "Image file. Direct image understanding requires a vision-capable model; otherwise use Terminal to decode the exact path." } else if len(b) <= 2_000_000 && bytes.IndexByte(b,0) == -1 { result["text"] = string(b) } else { result["text"] = "Binary or unsupported file format. Use Terminal with an appropriate decoder on the exact path." }
+	}
+	return result,nil
+}
+
+func mimeTypeForPath(path string,b []byte) string {
+	ct := http.DetectContentType(b)
+	if ct != "application/octet-stream" { return ct }
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".xlsx": return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".xls": return "application/vnd.ms-excel"
+	case ".csv": return "text/csv"
+	case ".md": return "text/markdown"
+	case ".py": return "text/x-python"
+	default: return ct
+	}
+}
+
+func extractSpreadsheetText(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	b,err := os.ReadFile(path); if err != nil { return "" }
+	switch ext { case ".xlsx": return extractXLSXText(b); case ".xls": return extractLegacyXLS(path); default: return "" }
+}
+
+func extractXLSXText(b []byte) string {
+	z,err := zip.NewReader(bytes.NewReader(b),int64(len(b))); if err != nil { return "" }
+	shared:=[]string{}
+	for _,f:=range z.File {
+		if f.Name!="xl/sharedStrings.xml" { continue }
+		r,err:=f.Open();if err!=nil{continue};shared=parseXlsxSharedStrings(r);r.Close()
+	}
+	type sheet struct{name,data string};sheets:=[]sheet{}
+	for _,f:=range z.File {
+		if !strings.HasPrefix(f.Name,"xl/worksheets/sheet")||!strings.HasSuffix(f.Name,".xml"){continue}
+		r,err:=f.Open();if err!=nil{continue};data:=parseXlsxSheet(r,shared);r.Close()
+		if strings.TrimSpace(data)!=""{sheets=append(sheets,sheet{filepath.Base(f.Name),data})}
+	}
+	sort.Slice(sheets,func(i,j int)bool{return sheets[i].name<sheets[j].name})
+	var out strings.Builder
+	for _,s:=range sheets { if out.Len()>0{out.WriteString("\n\n")};out.WriteString("# "+s.name+"\n");out.WriteString(s.data);if out.Len()>50000{break} }
+	return truncateText(out.String(),50000)
+}
+
+func parseXlsxSharedStrings(r io.Reader) []string {
+	dec:=xml.NewDecoder(r);out:=[]string{};inSI:=false;inT:=false;var cur strings.Builder
+	for { tok,err:=dec.Token();if err==io.EOF{break};if err!=nil{break};switch x:=tok.(type) {
+	case xml.StartElement:
+		if x.Name.Local=="si"{inSI=true;cur.Reset()}else if inSI&&x.Name.Local=="t"{inT=true}
+	case xml.CharData: if inSI&&inT{cur.Write([]byte(x))}
+	case xml.EndElement:
+		if x.Name.Local=="t"{inT=false}else if x.Name.Local=="si"{out=append(out,cur.String());inSI=false;inT=false}
+	}}
+	return out
+}
+
+func colIndex(ref string) int { n:=0;for _,r:=range ref{if r>='A'&&r<='Z'{n=n*26+int(r-'A'+1)}else if r>='a'&&r<='z'{n=n*26+int(r-'a'+1)}else{break}};return n }
+
+func parseXlsxSheet(r io.Reader,shared []string) string {
+	dec:=xml.NewDecoder(r);var out strings.Builder;inRow:=false;row:=map[int]string{};maxCol:=0;cellCol:=0;cellType:="";inV:=false;inT:=false;inIS:=false;var cellVal strings.Builder
+	flush:=func(){v:=cellVal.String();if cellType=="s"{if idx,e:=strconv.Atoi(strings.TrimSpace(v));e==nil&&idx>=0&&idx<len(shared){v=shared[idx]}};row[cellCol]=v;if cellCol>maxCol{maxCol=cellCol};cellVal.Reset();cellCol=0;cellType=""}
+	for { tok,err:=dec.Token();if err==io.EOF{break};if err!=nil{break};switch x:=tok.(type) {
+	case xml.StartElement:
+		switch x.Name.Local { case "row":inRow=true;row=map[int]string{};maxCol=0; case "c":cellVal.Reset();cellType="";cellCol=0;for _,a:=range x.Attr{if a.Name.Local=="r"{cellCol=colIndex(a.Value)};if a.Name.Local=="t"{cellType=a.Value}};case "v":inV=true;case "t":inT=true;case "is":inIS=true }
+	case xml.CharData: if inRow&&(inV||inT||inIS){cellVal.Write([]byte(x))}
+	case xml.EndElement:
+		switch x.Name.Local { case "v":inV=false;case "t":inT=false;case "is":inIS=false;case "c":flush();case "row":if inRow{vals:=make([]string,maxCol);for i:=1;i<=maxCol;i++{vals[i-1]=row[i]};out.WriteString(strings.TrimRight(strings.Join(vals,"\t"),"\t"));out.WriteByte('\n')};inRow=false }
+	}}
+	return strings.TrimSpace(out.String())
+}
+
+func extractLegacyXLS(path string) string {
+	if runtime.GOOS=="windows" { if v:=extractXLSViaPowerShell(path);v!=""{return v} }
+	for _,py:=range []string{"python","py"} { _,err:=exec.LookPath(py);if err!=nil{continue};script:="import sys\ntry:\n import xlrd\nexcept Exception:\n sys.exit(2)\nbook=xlrd.open_workbook(sys.argv[1], on_demand=True)\nfor s in book.sheets():\n print('# '+s.name)\n for r in range(s.nrows):\n  print('\\t'.join('' if s.cell_value(r,c) is None else str(s.cell_value(r,c)) for c in range(s.ncols)))\n";ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second);cmd:=exec.CommandContext(ctx,py,"-c",script,path);configureHiddenCommand(cmd);var out bytes.Buffer;cmd.Stdout=&out;cmd.Stderr=&out;err=cmd.Run();cancel();if err==nil&&strings.TrimSpace(out.String())!=""{return truncateText(out.String(),50000)} }
+	for _,tool:=range []string{"soffice","libreoffice"} { p,err:=exec.LookPath(tool);if err!=nil{continue};dir:=filepath.Join(dataDir(),"spreadsheet-convert");if os.MkdirAll(dir,0700)!=nil{continue};cmd:=exec.Command(p,"--headless","--convert-to","csv","--outdir",dir,path);configureHiddenCommand(cmd);_=cmd.Run();csv:=filepath.Join(dir,strings.TrimSuffix(filepath.Base(path),filepath.Ext(path))+".csv");if b,e:=os.ReadFile(csv);e==nil&&len(b)>0{return truncateText(string(b),50000)} }
+	return ""
+}
+
+func extractXLSViaPowerShell(path string) string {
+	q:=strings.ReplaceAll(filepath.Clean(path),"'","''")
+	script:="$ErrorActionPreference='Stop'; $excel=New-Object -ComObject Excel.Application; $excel.Visible=$false; $excel.DisplayAlerts=$false; $wb=$excel.Workbooks.Open('"+q+"',$null,$true); try { foreach($ws in $wb.Worksheets) { Write-Output ('# '+$ws.Name); $r=$ws.UsedRange; $rows=[int]$r.Rows.Count; $cols=[int]$r.Columns.Count; $v=$r.Value2; for($i=1;$i -le $rows;$i++){ $vals=@(); for($j=1;$j -le $cols;$j++){ $vals += [string]$v.Item($i,$j) }; Write-Output ([string]::Join([char]9,$vals)) } } } finally { $wb.Close($false); $excel.Quit() }"
+	ctx,cancel:=context.WithTimeout(context.Background(),20*time.Second);defer cancel();cmd:=exec.CommandContext(ctx,"powershell.exe","-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-Command",script);configureHiddenCommand(cmd);var out bytes.Buffer;cmd.Stdout=&out;cmd.Stderr=&out;if cmd.Run()==nil{return truncateText(out.String(),50000)};return ""
+}
+
+func truncateText(s string,n int) string { s=strings.TrimSpace(s);if len(s)>n{return s[:n]+"\n[truncated by AgentDesk]"};return s }
+
+func searchWorkspace(root,query string) []map[string]any {
+	q:=strings.ToLower(strings.TrimSpace(query));if q==""{return nil};hits:=[]map[string]any{};files:=0
+	_=filepath.WalkDir(root,func(path string,d os.DirEntry,err error)error{if err!=nil||len(hits)>=50{return nil};if d.IsDir(){return nil};files++;if files>300{return filepath.SkipDir};ext:=strings.ToLower(filepath.Ext(path));switch ext{case ".png",".jpg",".jpeg",".gif",".webp",".exe",".dll",".zip",".7z",".iso":return nil};info,e:=d.Info();if e!=nil||info.Size()>2000000{return nil};b,e:=os.ReadFile(path);if e!=nil||bytes.IndexByte(b,0)>=0{return nil};txt:=string(b);idx:=strings.Index(strings.ToLower(txt),q);if idx<0{return nil};start:=idx-120;if start<0{start=0};end:=idx+380;if end>len(txt){end=len(txt)};hits=append(hits,map[string]any{"path":path,"excerpt":txt[start:end]});return nil})
+	return hits
+}
+
+func runLocalCode(language,code string)(map[string]any,error){
+	if strings.TrimSpace(code)==""{return nil,fmt.Errorf("code is empty")};if len(code)>200000{return nil,fmt.Errorf("code is too large")}
+	dir:=filepath.Join(dataDir(),"agent-runs");if err:=os.MkdirAll(dir,0700);err!=nil{return nil,err}
+	lang:=strings.ToLower(strings.TrimSpace(language));ext:=".txt";var cmd *exec.Cmd
+	switch lang{case "python","py":ext=".py";cmd=exec.Command("python");case "javascript","js","node":ext=".js";cmd=exec.Command("node");case "go","golang":ext=".go";cmd=exec.Command("go","run");default:return nil,fmt.Errorf("supported languages: Python, JavaScript/Node, Go")}
+	file:=filepath.Join(dir,fmt.Sprintf("run-%d%s",time.Now().UnixNano(),ext));if err:=os.WriteFile(file,[]byte(code),0600);err!=nil{return nil,err};cmd.Args=append(cmd.Args,file)
+	ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second);defer cancel();cmd=exec.CommandContext(ctx,cmd.Path,cmd.Args[1:]...);cmd.Dir=dir;configureHiddenCommand(cmd);var out bytes.Buffer;cmd.Stdout=&out;cmd.Stderr=&out;err:=cmd.Run();if ctx.Err()==context.DeadlineExceeded{return map[string]any{"ok":false,"output":"Execution timed out after 15 seconds."},nil};return map[string]any{"ok":err==nil,"output":truncateText(out.String(),30000)},nil
+}
+
+func memorySearch(query string,limit int) []Memory {
+	m:=loadMem();if limit<=0{limit=8};q:=strings.ToLower(strings.TrimSpace(query));type scored struct{m Memory;s int};rows:=[]scored{}
+	for _,x:=range m{score:=0;t:=strings.ToLower(x.Text);if q==""{score=1}else{if strings.Contains(t,q){score+=12};for _,w:=range strings.Fields(q){w=strings.Trim(w,".,!?;:()[]{}");if w!=""&&strings.Contains(t,w){score+=2}}};if score>0{rows=append(rows,scored{x,score})}}
+	sort.SliceStable(rows,func(i,j int)bool{if rows[i].s!=rows[j].s{return rows[i].s>rows[j].s};return rows[i].m.Created>rows[j].m.Created})
+	out:=[]Memory{};for i:=0;i<minInt(limit,len(rows));i++{out=append(out,rows[i].m)};return out
+}
+func relevantMemories(query string,limit int)[]Memory{out:=memorySearch(query,limit);if len(out)>0{return out};m:=loadMem();sort.SliceStable(m,func(i,j int)bool{return m[i].Created>m[j].Created});if len(m)>limit{m=m[:limit]};return m}
+func looksSensitiveMemory(s string)bool{t:=strings.ToLower(s);for _,p:=range []string{"api key","api_key","apikey","password","passwd","secret","bearer ","access token","refresh token","private key","ghp_","sk-","xoxb-","authorization:"}{if strings.Contains(t,p){return true}};return false}
+func upsertMemories(items []Memory)(int,int,int,error){m:=loadMem();now:=time.Now().Format(time.RFC3339);added,updated,skipped:=0,0,0;for _,it:=range items{text:=strings.TrimSpace(it.Text);if text==""{continue};if len(text)>600{text=text[:600]};if looksSensitiveMemory(text){skipped++;continue};kind:=strings.TrimSpace(it.Kind);if kind==""{kind="fact"};norm:=strings.ToLower(strings.Join(strings.Fields(text)," "));found:=-1;for i,x:=range m{if strings.ToLower(strings.Join(strings.Fields(x.Text)," "))==norm{found=i;break}};if found>=0{m[found].Text=text;m[found].Kind=kind;m[found].Updated=now;m[found].LastUsed=now;if it.Source!=""{m[found].Source=it.Source};updated++}else{m=append(m,Memory{ID:strconv.FormatInt(time.Now().UnixNano(),10)+fmt.Sprintf("-%d",added),Text:text,Kind:kind,Created:now,Updated:now,LastUsed:now,Source:it.Source});added++}};if len(m)>500{sort.SliceStable(m,func(i,j int)bool{return m[i].Updated>m[j].Updated});m=m[:500]};return added,updated,skipped,saveMem(m)}
+
+func unsupportedImagePaths(messages []map[string]any)[]string{out:=[]string{};seen:=map[string]bool{};root:=filepath.Join(dataDir(),"uploads");for _,m:=range messages{parts,ok:=m["content"].([]any);if !ok{continue};for _,raw:=range parts{part,ok:=raw.(map[string]any);if !ok||part["type"]!="image_ref"{continue};ref,_:=part["image_ref"].(map[string]any);id,_:=ref["id"].(string);if id==""{continue};matches,_:=filepath.Glob(filepath.Join(root,filepath.Base(id)+".*"));if len(matches)>0&&!seen[matches[0]]{seen[matches[0]]=true;out=append(out,matches[0])}}};return out}
+func hasImageAttachments(messages []map[string]any)bool{return len(unsupportedImagePaths(messages))>0}
+func replaceUnsupportedImages(messages []map[string]any,allowTerminal bool)[]map[string]any{out:=make([]map[string]any,0,len(messages));for _,m:=range messages{c:=make(map[string]any,len(m));for k,v:=range m{c[k]=v};parts,ok:=m["content"].([]any);if !ok{out=append(out,c);continue};newParts:=[]any{};for _,raw:=range parts{part,ok:=raw.(map[string]any);if !ok{newParts=append(newParts,raw);continue};if part["type"]=="file_ref"{continue};if part["type"]!="image_ref"{newParts=append(newParts,part);continue};ref,_:=part["image_ref"].(map[string]any);name,_:=ref["name"].(string);id,_:=ref["id"].(string);path:="";matches,_:=filepath.Glob(filepath.Join(dataDir(),"uploads",filepath.Base(id)+".*"));if len(matches)>0{path=matches[0]};message:="[Image attached: "+name+"]\nLocal path: "+path+"\nThis selected model does not support vision/image inputs.";if allowTerminal{message+=" Use terminal_run or file_read on this exact path to decode the image into text or metadata. Do not infer the image from its filename."}else{message+=" Enable Terminal so AgentDesk can use this exact path with a decoder. Do not infer the image from its filename."};newParts=append(newParts,map[string]any{"type":"text","text":message})};c["content"]=newParts;out=append(out,c)};return out}
+
+func modelSupportsVision(p Provider)bool{base:=normalizeProviderBase(p.BaseURL);if base==""||p.Model==""{return false};req,err:=http.NewRequest("GET",base+"/models",nil);if err!=nil{return visionNameHeuristic(p.Model)};if p.APIKey!=""{req.Header.Set("Authorization","Bearer "+p.APIKey)};resp,err:=(&http.Client{Timeout:10*time.Second}).Do(req);if err!=nil{return visionNameHeuristic(p.Model)};defer resp.Body.Close();body,_:=io.ReadAll(io.LimitReader(resp.Body,8<<20));objs,err:=extractModelObjects(body);if err!=nil{return visionNameHeuristic(p.Model)};for _,obj:=range objs{id,_:=obj["id"].(string);if id!=p.Model{continue};if v,ok:=boolField(obj,"supports_vision");ok{return v};if v,ok:=boolField(obj,"vision");ok{return v};for _,k:=range []string{"input_modalities","inputModalities","modalities"}{if list:=stringListField(obj,k);len(list)>0{return containsImageToken(list)}};if a,ok:=obj["architecture"].(map[string]any);ok{for _,k:=range []string{"input_modalities","inputModalities"}{if list:=stringListField(a,k);len(list)>0{return containsImageToken(list)}}}};return visionNameHeuristic(p.Model)}
+func boolField(m map[string]any,key string)(bool,bool){v,ok:=m[key];if !ok{return false,false};switch x:=v.(type){case bool:return x,true;case string:b,err:=strconv.ParseBool(strings.TrimSpace(x));return b,err==nil;default:return false,false}}
+func stringListField(m map[string]any,key string)[]string{v,ok:=m[key];if !ok{return nil};switch x:=v.(type){case []any:out:=[]string{};for _,a:=range x{if s,ok:=a.(string);ok{out=append(out,strings.ToLower(s))}};return out;case []string:return x;default:return nil}}
+func containsImageToken(list []string)bool{for _,x:=range list{if strings.Contains(strings.ToLower(x),"image"){return true}};return false}
+func visionNameHeuristic(model string)bool{m:=strings.ToLower(model);for _,x:=range []string{"vision","vl","gpt-4o","gpt-4.1","gemini","gemma-3","claude-3","claude-sonnet-4","pixtral","llava","qwen2-vl","qwen2.5-vl","qwen3-vl"}{if strings.Contains(m,x){return true}};return false}
