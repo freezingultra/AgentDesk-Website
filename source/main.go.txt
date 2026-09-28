@@ -2143,7 +2143,8 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 		content := messageText(msg["content"])
 		if len(calls) == 0 {
 			if strings.TrimSpace(content) != "" {
-				send(map[string]any{"type": "chunk", "text": content})
+				// streamJSONResponse already emitted each content delta through onChunk.
+				// Do not emit the accumulated content again or the final answer is duplicated in the UI.
 				break
 			}
 			if round < 2 {
