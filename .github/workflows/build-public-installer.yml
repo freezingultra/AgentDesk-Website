@@ -1,0 +1,51 @@
+name: Build public AgentDesk installer
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out public source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+
+      - name: Build AgentDesk from public source snapshot
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $installer = '.agentdesk-build\release-assets\AgentDesk-Setup-v35.exe'
+          if (-not (Test-Path $installer)) { throw "Installer was not produced: $installer" }
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
+          "$hash  AgentDesk-Setup-v35.exe" | Set-Content '.agentdesk-build\release-assets\SHA256SUMS.txt'
+          Write-Host "SHA256: $hash"
+
+      - name: Publish public release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v35.1
+          name: AgentDesk v35.1
+          target_commitish: ${{ github.sha }}
+          body: |
+            Public Windows x64 installer built from the public AgentDesk V35 source snapshot.
+            This release is hosted in the public AgentDesk-Website repository so downloads do not require access to the private development repository.
+          files: |
+            .agentdesk-build/release-assets/AgentDesk-Setup-v35.exe
+            .agentdesk-build/release-assets/SHA256SUMS.txt
