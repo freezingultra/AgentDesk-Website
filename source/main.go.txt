@@ -99,6 +99,49 @@ type ResearchJob struct {
 var researchMu sync.Mutex
 var researchJobs = map[string]*ResearchJob{}
 
+var terminalApprovalMu sync.Mutex
+var terminalApprovals = map[string]chan string{}
+
+func requestTerminalApproval(send func(map[string]any), command string) string {
+	id := strconv.FormatInt(time.Now().UnixNano(), 10)
+	ch := make(chan string, 1)
+	terminalApprovalMu.Lock()
+	terminalApprovals[id] = ch
+	terminalApprovalMu.Unlock()
+	send(map[string]any{"type": "terminal_approval", "id": id, "command": command})
+	timer := time.NewTimer(2 * time.Minute)
+	defer timer.Stop()
+	decision := "no"
+	select {
+	case decision = <-ch:
+	case <-timer.C:
+	}
+	terminalApprovalMu.Lock()
+	delete(terminalApprovals, id)
+	terminalApprovalMu.Unlock()
+	return decision
+}
+
+func terminalApproval(w http.ResponseWriter, r *http.Request) {
+	var req struct { ID string `json:"id"`; Decision string `json:"decision"` }
+	if readJSON(r, &req) != nil { http.Error(w, "invalid request", 400); return }
+	req.ID = strings.TrimSpace(req.ID)
+	req.Decision = strings.ToLower(strings.TrimSpace(req.Decision))
+	if req.ID == "" || (req.Decision != "once" && req.Decision != "no" && req.Decision != "always") {
+		http.Error(w, "invalid approval", 400); return
+	}
+	terminalApprovalMu.Lock()
+	ch := terminalApprovals[req.ID]
+	terminalApprovalMu.Unlock()
+	if ch == nil { http.Error(w, "approval request expired", 404); return }
+	select {
+	case ch <- req.Decision:
+		jsonResp(w, map[string]any{"ok": true})
+	default:
+		jsonResp(w, map[string]any{"ok": false, "error": "approval already answered"})
+	}
+}
+
 func newResearchJob() *ResearchJob {
 	id := strconv.FormatInt(time.Now().UnixNano(), 10)
 	now := time.Now().Format(time.RFC3339)
@@ -360,7 +403,8 @@ func agentToolsForProvider(p Provider, allowTerminal bool, allowWeb bool) []map[
 			tools = []map[string]any{{"type": "browser_search"}}
 		}
 	}
-	tools = append(tools, localAgentToolDefinitions(allowTerminal)...)
+	// Terminal is always available to the agent; individual commands are approved at execution time.
+	tools = append(tools, localAgentToolDefinitions(true)...)
 	return tools
 }
 
@@ -2124,7 +2168,10 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	tracker := newCitationTracker()
 	messages = append([]map[string]any{sourceSystemInstruction()}, messages...)
-	tools := agentToolsForProvider(p, req.AllowTerminal, shouldOfferWebTools(lastUser, req.Research))
+	// Terminal is always available to the agent; command execution is approval-gated.
+	req.AllowTerminal = true
+	terminalAlways := false
+	tools := agentToolsForProvider(p, true, shouldOfferWebTools(lastUser, req.Research))
 	webSearchCalls := 0
 	const maxRegularWebSearches = 5
 	for round := 0; round < 20; round++ {
@@ -2201,16 +2248,25 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 			case "terminal_run":
 				var a TerminalReq
 				_ = json.Unmarshal([]byte(args), &a)
-				terminalLabel := "Terminal: " + strings.TrimSpace(a.Command)
+				command := strings.TrimSpace(a.Command)
+				terminalLabel := "Terminal: " + command
 				if strings.TrimSpace(a.CWD) != "" {
 					terminalLabel += "  [" + strings.TrimSpace(a.CWD) + "]"
 				}
-				send(map[string]string{"type": "tool", "text": terminalLabel})
-				if req.AllowTerminal {
-					result = runTerminalCommand(a)
-				} else {
-					result = map[string]any{"ok": false, "error": "Terminal access is not enabled for this chat."}
+				if command == "" {
+					result = map[string]any{"ok": false, "error": "Empty command."}
+					break
 				}
+				if !terminalAlways {
+					decision := requestTerminalApproval(send, command)
+					if decision == "always" { terminalAlways = true }
+					if decision == "no" {
+						result = map[string]any{"ok": false, "error": "User denied terminal command execution."}
+						break
+					}
+				}
+				send(map[string]string{"type": "tool", "text": terminalLabel})
+				result = runTerminalCommand(a)
 			default:
 				localResult, label, localErr := executeAgentLocalTool(name, args, req.AllowTerminal)
 				if localErr != nil {
@@ -2479,7 +2535,9 @@ func deepResearchWithLocation(p Provider, q string, requestedMax int, pos *GeoPo
 	cmsg, _ := cm["message"].(map[string]any)
 	ans, _ := cmsg["content"].(string)
 	if strings.TrimSpace(ans) == "" {
-		return "", sources, fmt.Errorf("provider returned an empty synthesis response")
+		// Some OpenAI-compatible providers return a successful completion with no visible content.
+		// Keep the gathered research usable instead of surfacing an empty-synthesis error.
+		return "## Research evidence\n\n" + joined, sources, nil
 	}
 	return ans, sources, nil
 }
@@ -3390,6 +3448,7 @@ func startupServer() string {
 	mux.HandleFunc("/api/run-code", runCode)
 	mux.HandleFunc("/api/terminal-info", terminalInfo)
 	mux.HandleFunc("/api/terminal-run", terminalRun)
+	mux.HandleFunc("/api/terminal-approval", terminalApproval)
 	mux.HandleFunc("/api/artifacts", createArtifacts)
 	mux.HandleFunc("/api/artifacts/", artifactDownload)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
