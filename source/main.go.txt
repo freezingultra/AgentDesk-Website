@@ -102,7 +102,7 @@ var researchJobs = map[string]*ResearchJob{}
 var terminalApprovalMu sync.Mutex
 var terminalApprovals = map[string]chan string{}
 
-func requestTerminalApproval(send func(map[string]any), command string) string {
+func requestTerminalApproval(send func(any), command string) string {
 	id := strconv.FormatInt(time.Now().UnixNano(), 10)
 	ch := make(chan string, 1)
 	terminalApprovalMu.Lock()
