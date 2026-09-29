@@ -75,8 +75,9 @@ type ChatReq struct {
 	MaxNewTok     int              `json:"maxNewTok"`
 	Agent         bool             `json:"agent"`
 	Research      bool             `json:"research"`
-	AllowTerminal bool             `json:"allowTerminal"`
-	Location      *GeoPosition     `json:"location,omitempty"`
+	AllowTerminal       bool             `json:"allowTerminal"`
+	TerminalApprovalMode string           `json:"terminalApprovalMode,omitempty"`
+	Location            *GeoPosition     `json:"location,omitempty"`
 }
 type ResearchReq struct {
 	Provider  string       `json:"provider"`
@@ -2170,7 +2171,7 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 	messages = append([]map[string]any{sourceSystemInstruction()}, messages...)
 	// Terminal is always available to the agent; command execution is approval-gated.
 	req.AllowTerminal = true
-	terminalAlways := false
+	terminalAlways := strings.EqualFold(strings.TrimSpace(req.TerminalApprovalMode), "always")
 	tools := agentToolsForProvider(p, true, shouldOfferWebTools(lastUser, req.Research))
 	webSearchCalls := 0
 	const maxRegularWebSearches = 5
