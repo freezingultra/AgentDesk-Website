@@ -2,6 +2,7 @@ const $ = s => document.querySelector(s);
 let config={providers:[]},memories=[],conversations=[];
 const state={messages:[],chatId:null,attachments:[],selectedProviderId:'',selectedModel:'',modelsByProvider:{}};
 let editingProviderId='';
+let terminalApprovalAlways=false;
 const codePackages=new Map();let packageSeq=0;const modelRefreshInFlight=new Set();
 
 async function api(path,opt={}){const r=await fetch(path,opt);const t=await r.text();let j;try{j=JSON.parse(t)}catch{j={error:t}}if(!r.ok)throw new Error(j.error||t);return j}
@@ -80,6 +81,7 @@ async function requestTerminalApproval(ev){
   modal.classList.remove('hidden');
   return new Promise(resolve=>{
     const finish=async decision=>{
+      if(decision==='always')terminalApprovalAlways=true;
       modal.classList.add('hidden');
       modal.querySelectorAll('[data-approval]').forEach(b=>b.onclick=null);
       try{await api('/api/terminal-approval',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ev.id,decision})})}catch{}
@@ -136,7 +138,7 @@ async function send(){
     const r=await fetch('/api/chat/stream',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({provider:p.id,model:currentModel(),messages:state.messages,maxNewTok:Number(p.maxNewTok)||4096,agent,research,allowTerminal:true,location:geo})
+      body:JSON.stringify({provider:p.id,model:currentModel(),messages:state.messages,maxNewTok:Number(p.maxNewTok)||4096,agent,research,allowTerminal:true,terminalApprovalMode:terminalApprovalAlways?'always':'ask',location:geo})
     });
     if(!r.ok)throw new Error(await r.text());
     const reader=r.body.getReader();
