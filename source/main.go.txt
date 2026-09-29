@@ -33,7 +33,7 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-const appVersion = "35.0"
+const appVersion = "35.2"
 
 type Provider struct {
 	ID        string   `json:"id"`
@@ -2470,14 +2470,14 @@ func deepResearchWithLocation(p Provider, q string, requestedMax int, pos *GeoPo
 	var sources []map[string]string
 	seenURLs := map[string]bool{}
 	researchCitations := newCitationTracker()
-	pagesPerSearch := 3
-	if searchPasses > 75 {
-		pagesPerSearch = 2
-	}
-	if searchPasses > 150 {
+	// Keep the evidence packet small enough for the final synthesis call. The previous
+	// 80k+ character floor could overflow smaller provider context windows, causing a
+	// successful research crawl to end with an empty synthesis.
+	pagesPerSearch := 2
+	if searchPasses > 12 {
 		pagesPerSearch = 1
 	}
-	corpusCharBudget := min(250000, max(80000, 25000+effective*4))
+	corpusCharBudget := min(42000, max(16000, 18000+effective*2))
 	for i, qq := range queries {
 		send(map[string]any{"type": "progress", "text": fmt.Sprintf("Search %d/%d: %s", i+1, len(queries), qq)})
 		rs := runSearchWithLocation(qq, pos)
@@ -2495,8 +2495,11 @@ func deepResearchWithLocation(p Provider, q string, requestedMax int, pos *GeoPo
 				page := fetchPage(rurl)
 				content, _ = page["text"].(string)
 			}
-			if len(content) > 4500 {
-				content = content[:4500] + "\n[page content truncated by AgentDesk]"
+			if len(snip) > 900 {
+				snip = snip[:900] + "…"
+			}
+			if len(content) > 2800 {
+				content = content[:2800] + "\n[page content truncated by AgentDesk]"
 			}
 			if title == "" {
 				title = rurl
@@ -2521,26 +2524,84 @@ func deepResearchWithLocation(p Provider, q string, requestedMax int, pos *GeoPo
 		{"role": "system", "content": "You are a careful research synthesizer. Produce a useful report with Summary, Findings, Uncertainties, and (when helpful) next steps. Attribute factual claims compactly using only source IDs like [S1] and [S2] when needed. The desktop UI displays the full source titles and URLs separately, so NEVER write a Sources/References/Bibliography section, NEVER repeat raw URLs, and NEVER emit a long citation list. Prefer at most one [S#] citation per paragraph and no more than 12 citations total unless the user explicitly asks for exhaustive attribution. Do not spend output budget on source metadata. Do not invent facts or source IDs. Current date: " + time.Now().Format("January 2, 2006")},
 		{"role": "user", "content": prompt},
 	})
-	res, e := doJSON(p, finalMsgs, nil, reportReserve)
-	if e != nil {
-		// Return usable research evidence instead of turning a synthesis failure into
-		// a generic network error. The UI can still show the gathered sources.
-		raw := "## Research evidence\n\n" + joined
-		return raw, sources, nil
-	}
-	cc, _ := res["choices"].([]any)
-	if len(cc) == 0 {
-		return "", sources, fmt.Errorf("provider returned no synthesis choices")
-	}
-	cm, _ := cc[0].(map[string]any)
-	cmsg, _ := cm["message"].(map[string]any)
-	ans, _ := cmsg["content"].(string)
-	if strings.TrimSpace(ans) == "" {
-		// Some OpenAI-compatible providers return a successful completion with no visible content.
-		// Keep the gathered research usable instead of surfacing an empty-synthesis error.
-		return "## Research evidence\n\n" + joined, sources, nil
+	ans, synthErr := synthesizeResearchReport(p, finalMsgs, joined, q, reportReserve)
+	if synthErr != nil {
+		// Never dump the raw provider payload as the final report. Return a readable
+		// evidence digest so the research job remains useful even when synthesis fails.
+		return researchEvidenceDigest(q, sources, corpus), sources, nil
 	}
 	return ans, sources, nil
+}
+
+
+func synthesizeResearchReport(p Provider, finalMsgs []map[string]any, joined, question string, reportReserve int) (string, error) {
+	res, err := doJSON(p, finalMsgs, nil, reportReserve)
+	if err == nil {
+		if cc, _ := res["choices"].([]any); len(cc) > 0 {
+			if cm, _ := cc[0].(map[string]any); cm != nil {
+				if cmsg, _ := cm["message"].(map[string]any); cmsg != nil {
+					if ans, _ := cmsg["content"].(string); strings.TrimSpace(ans) != "" {
+						return ans, nil
+					}
+				}
+			}
+		}
+	}
+	// Retry once with a compact evidence packet. This handles providers that accept the
+	// research crawl but reject the larger synthesis context or return an empty choice.
+	compact := joined
+	if len(compact) > 14000 {
+		compact = compact[:14000] + "\n[compact evidence truncated by AgentDesk]"
+	}
+	retryMsgs := withMemory([]map[string]any{
+		{"role": "system", "content": "Write a concise research report from the supplied evidence. Use exactly these headings when applicable: Summary, Findings, Uncertainties, Next steps. Cite only source IDs such as [S1]. Do not output raw URLs or a Sources/References section. If evidence is incomplete, say so explicitly."},
+		{"role": "user", "content": "Research question: " + question + "\n\nEvidence:\n" + compact},
+	})
+	retry, retryErr := doJSON(p, retryMsgs, nil, max(1024, min(reportReserve, 3000)))
+	if retryErr != nil {
+		return "", retryErr
+	}
+	if cc, _ := retry["choices"].([]any); len(cc) > 0 {
+		if cm, _ := cc[0].(map[string]any); cm != nil {
+			if cmsg, _ := cm["message"].(map[string]any); cmsg != nil {
+				if ans, _ := cmsg["content"].(string); strings.TrimSpace(ans) != "" {
+					return ans, nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("provider returned an empty synthesis response")
+}
+
+func researchEvidenceDigest(question string, sources []map[string]string, corpus []string) string {
+	var b strings.Builder
+	b.WriteString("## Summary\n\n")
+	b.WriteString("AgentDesk collected web evidence for **")
+	b.WriteString(strings.TrimSpace(question))
+	b.WriteString("** but the selected provider did not return a usable synthesis. The evidence below is organized by source so it can still be reviewed without exposing raw provider JSON.\n\n")
+	b.WriteString("## Findings\n\n")
+	for i, src := range sources {
+		if i >= 12 {
+			break
+		}
+		b.WriteString("- **")
+		b.WriteString(src["id"])
+		b.WriteString(" · ")
+		b.WriteString(src["title"])
+		b.WriteString("**")
+		if snip := strings.TrimSpace(src["snippet"]); snip != "" {
+			b.WriteString(": ")
+			b.WriteString(snip)
+		}
+		b.WriteString("\n")
+	}
+	if len(sources) == 0 {
+		b.WriteString("- No readable sources were returned.\n")
+	}
+	b.WriteString("\n## Uncertainties\n\n")
+	b.WriteString("- Automatic synthesis failed for the selected provider, so these findings are source excerpts rather than a model-generated conclusion.\n")
+	b.WriteString("- Verify important claims against the linked source pages in the Sources panel.\n")
+	return b.String()
 }
 
 func deepResearch(p Provider, q string, max int, send func(map[string]any)) (string, []map[string]string, error) {
@@ -2890,6 +2951,180 @@ func filterAboveModels(baseURL, apiKey string, objects []map[string]any) ([]map[
 		}
 	}
 	return filtered, nil
+}
+
+
+type GroqTranscribeReq struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model,omitempty"`
+	Language string `json:"language,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
+}
+
+type GroqSpeechReq struct {
+	Provider      string `json:"provider"`
+	Model         string `json:"model,omitempty"`
+	Voice         string `json:"voice,omitempty"`
+	Input         string `json:"input"`
+	ResponseFormat string `json:"responseFormat,omitempty"`
+}
+
+func requireGroqProvider(id string) (Provider, error) {
+	p, err := providerByID(id)
+	if err != nil {
+		return Provider{}, err
+	}
+	if !isGroqProvider(p) {
+		return Provider{}, fmt.Errorf("speech features currently require a Groq provider")
+	}
+	if strings.TrimSpace(p.APIKey) == "" {
+		return Provider{}, fmt.Errorf("Groq API key is required")
+	}
+	return p, nil
+}
+
+func groqTranscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if err := r.ParseMultipartForm(25 << 20); err != nil {
+		http.Error(w, "audio file is too large or invalid", 400)
+		return
+	}
+	providerID := strings.TrimSpace(r.FormValue("provider"))
+	p, err := requireGroqProvider(providerID)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	model := strings.TrimSpace(r.FormValue("model"))
+	if model == "" {
+		model = "whisper-large-v3-turbo"
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "audio file is required", 400)
+		return
+	}
+	defer file.Close()
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", filepath.Base(header.Filename))
+	if err != nil {
+		http.Error(w, "could not prepare audio upload", 500)
+		return
+	}
+	if _, err = io.Copy(part, io.LimitReader(file, 25<<20)); err != nil {
+		http.Error(w, "could not read audio upload", 400)
+		return
+	}
+	_ = mw.WriteField("model", model)
+	_ = mw.WriteField("response_format", "json")
+	if language := strings.TrimSpace(r.FormValue("language")); language != "" {
+		_ = mw.WriteField("language", language)
+	}
+	if prompt := strings.TrimSpace(r.FormValue("prompt")); prompt != "" {
+		_ = mw.WriteField("prompt", prompt)
+	}
+	if err := mw.Close(); err != nil {
+		http.Error(w, "could not finalize audio upload", 500)
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, normalizeProviderBase(p.BaseURL)+"/audio/transcriptions", &body)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion)
+	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode >= 400 {
+		http.Error(w, strings.TrimSpace(string(data)), resp.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
+}
+
+func groqSpeech(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req GroqSpeechReq
+	if readJSON(r, &req) != nil {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	p, err := requireGroqProvider(req.Provider)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	if req.Model == "" {
+		req.Model = "canopylabs/orpheus-v1-english"
+	}
+	req.Voice = strings.TrimSpace(req.Voice)
+	if req.Voice == "" {
+		req.Voice = "hannah"
+	}
+	req.Input = strings.TrimSpace(req.Input)
+	if req.Input == "" {
+		http.Error(w, "text input is required", 400)
+		return
+	}
+	if len([]rune(req.Input)) > 200 {
+		http.Error(w, "Groq Orpheus TTS accepts at most 200 characters per request", 400)
+		return
+	}
+	req.ResponseFormat = strings.ToLower(strings.TrimSpace(req.ResponseFormat))
+	if req.ResponseFormat == "" {
+		req.ResponseFormat = "wav"
+	}
+	payload := map[string]any{
+		"model": req.Model,
+		"voice": req.Voice,
+		"input": req.Input,
+		"response_format": req.ResponseFormat,
+	}
+	b, _ := json.Marshal(payload)
+	httpReq, err := http.NewRequest(http.MethodPost, normalizeProviderBase(p.BaseURL)+"/audio/speech", bytes.NewReader(b))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", "AgentDesk/"+appVersion)
+	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(httpReq)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		http.Error(w, strings.TrimSpace(string(data)), resp.StatusCode)
+		return
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		ct = "audio/wav"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 16<<20))
 }
 
 func modelsDraft(w http.ResponseWriter, r *http.Request) {
@@ -3450,6 +3685,8 @@ func startupServer() string {
 	mux.HandleFunc("/api/terminal-info", terminalInfo)
 	mux.HandleFunc("/api/terminal-run", terminalRun)
 	mux.HandleFunc("/api/terminal-approval", terminalApproval)
+	mux.HandleFunc("/api/groq/transcribe", groqTranscribe)
+	mux.HandleFunc("/api/groq/speech", groqSpeech)
 	mux.HandleFunc("/api/artifacts", createArtifacts)
 	mux.HandleFunc("/api/artifacts/", artifactDownload)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
