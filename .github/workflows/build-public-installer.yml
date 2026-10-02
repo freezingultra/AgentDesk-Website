@@ -31,21 +31,21 @@ jobs:
       - name: Verify installer
         shell: pwsh
         run: |
-          $installer = '.agentdesk-build\release-assets\AgentDesk-Setup-v35.2.exe'
+          $installer = '.agentdesk-build\release-assets\AgentDesk-Setup-v36.0.exe'
           if (-not (Test-Path $installer)) { throw "Installer was not produced: $installer" }
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
-          "$hash  AgentDesk-Setup-v35.2.exe" | Set-Content '.agentdesk-build\release-assets\SHA256SUMS.txt'
+          "$hash  AgentDesk-Setup-v36.0.exe" | Set-Content '.agentdesk-build\release-assets\SHA256SUMS.txt'
           Write-Host "SHA256: $hash"
 
       - name: Publish public release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v35.2
-          name: AgentDesk v35.2
+          tag_name: v36.0
+          name: AgentDesk v36.0
           target_commitish: ${{ github.sha }}
           body: |
-            Public Windows x64 installer built from the public AgentDesk V35.2 source snapshot.
+            Public Windows x64 installer built from the public AgentDesk V36.0 source snapshot.
             This release is hosted in the public AgentDesk-Website repository so downloads do not require access to the private development repository.
           files: |
-            .agentdesk-build/release-assets/AgentDesk-Setup-v35.2.exe
+            .agentdesk-build/release-assets/AgentDesk-Setup-v36.0.exe
             .agentdesk-build/release-assets/SHA256SUMS.txt
