@@ -1,0 +1,444 @@
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type LocalSettings struct {
+	OnboardingComplete bool         `json:"onboardingComplete"`
+	HasNvidiaGPU       bool         `json:"hasNvidiaGPU"`
+	GPUName            string       `json:"gpuName,omitempty"`
+	VRAMGB             float64      `json:"vramGB,omitempty"`
+	CPUCores           int          `json:"cpuCores,omitempty"`
+	CPUThreads         int          `json:"cpuThreads,omitempty"`
+	CPUTier            string       `json:"cpuTier,omitempty"`
+	CPUBenchmark       float64      `json:"cpuBenchmark,omitempty"`
+	RAMGB              float64      `json:"ramGB,omitempty"`
+	RAMSpeedMHz        int          `json:"ramSpeedMHz,omitempty"`
+	PrivacyMode        string       `json:"privacyMode,omitempty"`
+	HFToken            string       `json:"hfToken,omitempty"`
+	Models             []LocalModel `json:"models,omitempty"`
+}
+
+type LocalModel struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	RepoID      string `json:"repoId"`
+	File        string `json:"file"`
+	Path        string `json:"path"`
+	MMProjPath  string `json:"mmprojPath,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	Vision      bool   `json:"vision,omitempty"`
+	InstalledAt string `json:"installedAt,omitempty"`
+}
+
+type LocalRecommendation struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	RepoID    string `json:"repoId"`
+	Reason    string `json:"reason"`
+	SizeHint  string `json:"sizeHint"`
+	Vision    bool   `json:"vision,omitempty"`
+}
+
+type LocalModelInfo struct {
+	RepoID   string              `json:"repoId"`
+	Gated    bool                `json:"gated"`
+	Files    []map[string]any    `json:"files"`
+	Selected []map[string]any    `json:"selected,omitempty"`
+}
+
+type localRuntime struct {
+	mu      sync.Mutex
+	modelID string
+	baseURL string
+	cmd     *exec.Cmd
+}
+
+var localRT localRuntime
+
+func localDir() string { d := filepath.Join(dataDir(), "local"); _ = os.MkdirAll(d, 0700); return d }
+func localModelsDir() string { d := filepath.Join(localDir(), "models"); _ = os.MkdirAll(d, 0700); return d }
+func localEngineDir() string { d := filepath.Join(localDir(), "engine"); _ = os.MkdirAll(d, 0700); return d }
+
+func loadLocalSettings() LocalSettings {
+	c := loadConfig()
+	return c.Local
+}
+
+func saveLocalSettings(s LocalSettings) error {
+	c := loadConfig()
+	c.Local = s
+	return saveConfig(c)
+}
+
+func localVirtualProvider(m LocalModel) Provider {
+	id := "local:" + m.ID
+	return Provider{ID: id, Name: "Local · " + m.Name, BaseURL: "local://" + m.ID, Model: m.ID, Models: []string{m.ID}, MaxNewTok: 4096}
+}
+
+func localModelByID(id string) (LocalModel, error) {
+	s := loadLocalSettings()
+	for _, m := range s.Models {
+		if m.ID == id || m.File == id {
+			return m, nil
+		}
+	}
+	return LocalModel{}, fmt.Errorf("local model not found")
+}
+
+func localProviderFromID(id string) (Provider, error) {
+	modelID := strings.TrimPrefix(id, "local:")
+	m, err := localModelByID(modelID)
+	if err != nil { return Provider{}, err }
+	base, err := ensureLocalRuntime(m)
+	if err != nil { return Provider{}, err }
+	p := localVirtualProvider(m)
+	p.BaseURL = base
+	p.Model = m.ID
+	return p, nil
+}
+
+func parseLocalProviderID(id string) bool { return strings.HasPrefix(strings.TrimSpace(id), "local:") }
+
+func detectExistingLocalModels() []LocalModel {
+ s:=loadLocalSettings()
+ out:=append([]LocalModel(nil),s.Models...)
+ seen:=map[string]bool{}
+ for _,m:=range out{seen[m.Path]=true}
+ home,_:=os.UserHomeDir()
+ for _,root:=range []string{filepath.Join(home,"Downloads"),filepath.Join(home,"models"),filepath.Join(home,"Documents","Models")}{
+  entries,err:=os.ReadDir(root);if err!=nil{continue}
+  for _,e:=range entries{
+   if e.IsDir()||!strings.HasSuffix(strings.ToLower(e.Name()),".gguf"){continue}
+   p:=filepath.Join(root,e.Name());if seen[p]{continue}
+   info,err:=e.Info();if err!=nil{continue}
+   id:="localfile:"+fmt.Sprintf("%x",sha256.Sum256([]byte(p)))
+   out=append(out,LocalModel{ID:id,Name:e.Name(),RepoID:"Local file",File:e.Name(),Path:p,Size:info.Size(),Vision:strings.Contains(strings.ToLower(e.Name()),"vision"),InstalledAt:time.Now().Format(time.RFC3339)})
+   seen[p]=true
+  }
+ }
+ return out
+}
+
+func scanLocalHardware() (map[string]any, error) {
+	cores := runtime.NumCPU()
+	threads := runtime.NumCPU()
+	gpuName, vram := "", 0.0
+	hasGPU := false
+	ramGB, ramSpeed := systemMemory()
+	if runtime.GOOS == "windows" {
+		if name, total, ok := scanNvidiaWindows(); ok {
+			hasGPU, gpuName, vram = true, name, total
+		}
+		if v := powershellText("(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty NumberOfCores)"); v != "" { cores, _ = strconv.Atoi(strings.TrimSpace(v)) }
+		if v := powershellText("(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty NumberOfLogicalProcessors)"); v != "" { threads, _ = strconv.Atoi(strings.TrimSpace(v)) }
+	}
+	score := benchmarkLocalCPU()
+	tier := classifyLocalCPU(cores, score)
+	s := loadLocalSettings()
+	s.HasNvidiaGPU, s.GPUName, s.VRAMGB = hasGPU, gpuName, vram
+	s.CPUCores, s.CPUThreads, s.CPUBenchmark, s.CPUTier = cores, threads, score, tier
+	s.RAMGB, s.RAMSpeedMHz = ramGB, ramSpeed
+	s.Models = detectExistingLocalModels()
+	_ = saveLocalSettings(s)
+	for _, m := range s.Models { upsertLocalProvider(m) }
+	return map[string]any{
+		"nvidia": hasGPU, "gpuName": gpuName, "vramGB": vram,
+		"cpuCores": cores, "cpuThreads": threads, "cpuTier": tier, "cpuBenchmark": score,
+		"ramGB": ramGB, "ramSpeedMHz": ramSpeed, "os": runtime.GOOS,
+	}, nil
+}
+
+func powershellText(script string) string {
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	configureHiddenCommand(cmd)
+	var out bytes.Buffer; cmd.Stdout = &out; cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil { return "" }
+	return strings.TrimSpace(out.String())
+}
+
+func scanNvidiaWindows() (string, float64, bool) {
+	if _, err := exec.LookPath("nvidia-smi.exe"); err != nil {
+		if _, err = exec.LookPath("nvidia-smi"); err != nil { return "", 0, false }
+	}
+	cmd := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits")
+	configureHiddenCommand(cmd)
+	b, err := cmd.Output()
+	if err != nil { return "", 0, false }
+	line := strings.TrimSpace(strings.Split(string(b), "\n")[0])
+	parts := strings.Split(line, ",")
+	if len(parts) < 2 { return "", 0, false }
+	mb, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil { return "", 0, false }
+	return strings.TrimSpace(parts[0]), mb / 1024.0, true
+}
+
+func systemMemory() (float64, int) {
+	if runtime.GOOS == "windows" {
+		total := powershellText("[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)")
+		speed := powershellText("$x=Get-CimInstance Win32_PhysicalMemory | Where-Object ConfiguredClockSpeed | Measure-Object ConfiguredClockSpeed -Average; [math]::Round($x.Average)")
+		g, _ := strconv.ParseFloat(strings.TrimSpace(total), 64); mhz, _ := strconv.Atoi(strings.TrimSpace(speed))
+		return g, mhz
+	}
+	if runtime.GOOS == "linux" {
+		if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+			for _, line := range strings.Split(string(b), "\n") {
+				if strings.HasPrefix(line, "MemTotal:") {
+					f := strings.Fields(line); if len(f) >= 2 { kb, _ := strconv.ParseFloat(f[1], 64); return kb / 1024 / 1024, 0 }
+				}
+			}
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if out := commandOutput("sysctl", "-n", "hw.memsize"); out != "" { b, _ := strconv.ParseFloat(out, 64); return b / 1024 / 1024 / 1024, 0 }
+	}
+	return 0, 0
+}
+
+func commandOutput(name string, args ...string) string {
+	cmd := exec.Command(name, args...); configureHiddenCommand(cmd); b, err := cmd.Output(); if err != nil { return "" }; return strings.TrimSpace(string(b))
+}
+
+func benchmarkLocalCPU() float64 {
+	buf := make([]byte, 4096)
+	for i := range buf { buf[i] = byte(i * 31) }
+	start := time.Now(); loops := int64(0); var digest [32]byte
+	for time.Since(start) < 350*time.Millisecond {
+		digest = sha256.Sum256(buf); buf[0] ^= digest[0]; loops++
+	}
+	if loops <= 0 { return 0 }
+	return float64(loops) / 1000.0
+}
+
+func classifyLocalCPU(cores int, score float64) string {
+	if cores > 16 || score >= 700 { return "Workstation · Threadripper/Epyc class" }
+	if cores >= 8 && score >= 250 { return "High end · Ryzen 7/Ryzen 9/I7/I9 class" }
+	if cores >= 6 && score >= 120 { return "Mid range · Ryzen 5/Old-I7 class" }
+	return "Low end · I3/Old-I5 class"
+}
+
+func localRecommendations(s LocalSettings) []LocalRecommendation {
+	out := []LocalRecommendation{
+		{ID:"qwen3-4b",Name:"Qwen3 4B Q4_K_M",RepoID:"ggml-org/Qwen3-4B-GGUF",Reason:"Small general-purpose local model with a balanced memory footprint.",SizeHint:"~2.5 GB",Vision:false},
+	}
+	if s.RAMGB >= 12 || s.VRAMGB >= 6 {
+		out = append(out, LocalRecommendation{ID:"qwen3-8b",Name:"Qwen3 8B Q4_K_M",RepoID:"Qwen/Qwen3-8B-GGUF",Reason:"Larger general model when your system has more memory headroom.",SizeHint:"~5 GB",Vision:false})
+	}
+	if s.VRAMGB >= 4 || s.RAMGB >= 12 {
+		out = append(out, LocalRecommendation{ID:"gemma3-4b",Name:"Gemma 3 4B IT Q4_K_M",RepoID:"ggml-org/gemma-3-4b-it-GGUF",Reason:"Compact multimodal-capable model for local text and image work.",SizeHint:"~2.5 GB + projector for vision",Vision:true})
+	}
+	if s.RAMGB >= 8 {
+		out = append(out, LocalRecommendation{ID:"granite-vision-3.3-2b",Name:"IBM Granite Vision 3.3 2B Q4_K_M",RepoID:"ibm-granite/granite-vision-3.3-2b-GGUF",Reason:"Local image-to-text encoder for models that do not accept images.",SizeHint:"~1.55 GB + ~893 MB projector",Vision:true})
+	}
+	return out
+}
+
+func normalizeHFRepo(raw string) (repo, file string, err error) {
+	x := strings.TrimSpace(raw)
+	if x == "" { return "", "", fmt.Errorf("model URL is required") }
+	if !strings.Contains(x, "://") && strings.Count(x, "/") == 1 { return x, "", nil }
+	u, e := url.Parse(x); if e != nil { return "", "", fmt.Errorf("invalid model URL") }
+	if !strings.EqualFold(u.Hostname(), "huggingface.co") { return "", "", fmt.Errorf("model URL must point to huggingface.co") }
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for len(parts) > 0 && (parts[0] == "models" || parts[0] == "model") { parts = parts[1:] }
+	if len(parts) < 2 { return "", "", fmt.Errorf("use a Hugging Face model URL such as https://huggingface.co/org/model") }
+	repo = parts[0] + "/" + parts[1]
+	for i := 2; i < len(parts); i++ {
+		if parts[i] == "resolve" || parts[i] == "blob" { if i+2 < len(parts) { file = strings.Join(parts[i+2:], "/") }; break }
+	}
+	return repo, file, nil
+}
+
+func hfRequest(path, token string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", "https://huggingface.co"+path, nil); if err != nil { return nil, err }
+	req.Header.Set("User-Agent", "AgentDesk/"+appVersion)
+	if strings.TrimSpace(token) != "" { req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token)) }
+	return (&http.Client{Timeout: 45*time.Second}).Do(req)
+}
+
+func inspectHFModel(rawURL, token string) (LocalModelInfo, bool, error) {
+	repo, direct, err := normalizeHFRepo(rawURL); if err != nil { return LocalModelInfo{}, false, err }
+	resp, err := hfRequest("/api/models/"+url.PathEscape(repo), token); if err != nil { return LocalModelInfo{}, false, err }
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if resp.StatusCode == 401 || resp.StatusCode == 403 { return LocalModelInfo{}, true, fmt.Errorf("Hugging Face requires authentication for this model") }
+	if resp.StatusCode == 404 { return LocalModelInfo{}, false, fmt.Errorf("Hugging Face model not found: %s", repo) }
+	if resp.StatusCode >= 400 { return LocalModelInfo{}, false, fmt.Errorf("Hugging Face HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))) }
+	var raw struct { Gated any `json:"gated"`; Private bool `json:"private"`; Siblings []struct { RFilename string `json:"rfilename"`; Size int64 `json:"size"` } `json:"siblings"` }
+	if err := json.Unmarshal(body, &raw); err != nil { return LocalModelInfo{}, false, err }
+	gated := false; switch v := raw.Gated.(type) { case bool: gated=v; case string: gated=strings.EqualFold(v,"true") }
+	files := make([]map[string]any,0,len(raw.Siblings))
+	for _, f := range raw.Siblings { if strings.TrimSpace(f.RFilename)=="" { continue }; files=append(files,map[string]any{"name":f.RFilename,"size":f.Size}) }
+	info := LocalModelInfo{RepoID:repo,Gated:gated,Files:files}
+	if direct != "" { for _, f := range files { if f["name"] == direct { if !strings.HasSuffix(strings.ToLower(direct), ".gguf") { return info, false, fmt.Errorf("AgentDesk Local Engine currently requires a GGUF model file") }; info.Selected=[]map[string]any{f}; return info, false, nil } } }
+	info.Selected = selectLocalGGUFs(files, loadLocalSettings(), false)
+	if len(info.Selected)==0 { return info, false, fmt.Errorf("no GGUF model file was found. AgentDesk Local Engine currently runs GGUF models; other Hub formats need a compatible conversion.") }
+	return info, false, nil
+}
+
+func selectLocalGGUFs(files []map[string]any, s LocalSettings, vision bool) []map[string]any {
+	type candidate struct { m map[string]any; score int; size int64 }
+	var cs []candidate
+	for _, f := range files {
+		n,_ := f["name"].(string); low:=strings.ToLower(n); if !strings.HasSuffix(low,".gguf") || strings.Contains(low,"mmproj") { continue }
+		if vision && !strings.Contains(low,"vision") { continue }
+		if !vision && strings.Contains(low,"vision") && !strings.Contains(low,"instruct") { continue }
+		size := int64(0); switch v:=f["size"].(type){case float64:size=int64(v);case int64:size=v}
+		score:=0
+		for i,q:=range []string{"q4_k_m","q5_k_m","q4_k_s","q5_k_s","q6_k","q8_0","q3_k_m","q2_k"}{if strings.Contains(low,q){score+=100-i*5;break}}
+		if strings.Contains(low,"instruct")||strings.Contains(low,"it"){score+=25}
+		budget:=s.RAMGB*1024*1024*1024*0.70 + s.VRAMGB*1024*1024*1024*0.85
+		if budget>0 && size>0 && float64(size)>budget {score-=1000}
+		cs=append(cs,candidate{f,score,size})
+	}
+	sort.Slice(cs,func(i,j int)bool{if cs[i].score!=cs[j].score{return cs[i].score>cs[j].score};return cs[i].size<cs[j].size})
+	if len(cs)==0{return nil}; return []map[string]any{cs[0].m}
+}
+
+func hfDownload(repo, file, token, dest string) (int64, error) {
+	u := "https://huggingface.co/"+repo+"/resolve/main/"+strings.TrimLeft(file,"/")
+	req, err := http.NewRequest("GET",u,nil); if err!=nil{return 0,err}
+	req.Header.Set("User-Agent","AgentDesk/"+appVersion); if strings.TrimSpace(token)!=""{req.Header.Set("Authorization","Bearer "+strings.TrimSpace(token))}
+	resp,err:=(&http.Client{Timeout:0}).Do(req);if err!=nil{return 0,err};defer resp.Body.Close()
+	if resp.StatusCode==401||resp.StatusCode==403{return 0,fmt.Errorf("Hugging Face requires authentication for this file")}
+	if resp.StatusCode>=400{return 0,fmt.Errorf("Hugging Face download HTTP %d",resp.StatusCode)}
+	if err:=os.MkdirAll(filepath.Dir(dest),0700);err!=nil{return 0,err}
+	tmp:=dest+".part"; f,err:=os.Create(tmp);if err!=nil{return 0,err};n,copyErr:=io.Copy(f,resp.Body);f.Close();if copyErr!=nil{os.Remove(tmp);return n,copyErr};if err:=os.Rename(tmp,dest);err!=nil{os.Remove(tmp);return n,err};return n,nil
+}
+
+func ensureLocalEngine() (string,error) {
+	ext := ""; if runtime.GOOS=="windows" { ext=".exe" }
+	server := filepath.Join(localEngineDir(),"llama-server"+ext)
+	if _,err:=os.Stat(server);err==nil{return server,nil}
+	if runtime.GOOS!="windows" { return "",fmt.Errorf("AgentDesk Local Engine bootstrap currently supports Windows builds; the model manager is ready for other platforms") }
+	req,_:=http.NewRequest("GET","https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",nil);req.Header.Set("User-Agent","AgentDesk/"+appVersion)
+	resp,err:=(&http.Client{Timeout:30*time.Second}).Do(req);if err!=nil{return "",err};defer resp.Body.Close();body,_:=io.ReadAll(io.LimitReader(resp.Body,16<<20));if resp.StatusCode>=400{return "",fmt.Errorf("local engine release lookup failed: HTTP %d",resp.StatusCode)}
+	var rel struct{TagName string `json:"tag_name"`;Assets []struct{Name string `json:"name"`;URL string `json:"browser_download_url"`} `json:"assets"`}
+	if json.Unmarshal(body,&rel)!=nil{return "",fmt.Errorf("invalid local engine release metadata")}
+	wantCPU, wantCUDA := "llama-"+rel.TagName+"-bin-win-cpu-x64.zip", "llama-"+rel.TagName+"-bin-win-cuda-12.4-x64.zip"
+	asset := ""; for _,a:=range rel.Assets{if a.Name==wantCUDA && loadLocalSettings().HasNvidiaGPU{asset=a.URL;break};if a.Name==wantCPU{if asset==""{asset=a.URL}}}
+	if asset==""{return "",fmt.Errorf("no Windows x64 Local Engine build was found in llama.cpp release %s",rel.TagName)}
+	zipPath:=filepath.Join(localEngineDir(),"engine.zip");req,_=http.NewRequest("GET",asset,nil);req.Header.Set("User-Agent","AgentDesk/"+appVersion);resp,err=(&http.Client{Timeout:0}).Do(req);if err!=nil{return "",err};defer resp.Body.Close();f,err:=os.Create(zipPath);if err!=nil{return "",err};_,err=io.Copy(f,resp.Body);f.Close();if err!=nil{return "",err}
+	zr,err:=zip.OpenReader(zipPath);if err!=nil{return "",err};defer zr.Close();for _,zf:=range zr.File{if zf.FileInfo().IsDir(){continue};base:=filepath.Base(zf.Name);if base==""{continue};if err:=extractZipFile(zf,filepath.Join(localEngineDir(),base));err!=nil{return "",err}}
+	if _,err:=os.Stat(server);err!=nil{return "",fmt.Errorf("local engine archive did not contain llama-server.exe")}
+	_ = os.Remove(zipPath)
+	if loadLocalSettings().HasNvidiaGPU {
+		for _,a:=range rel.Assets { if strings.HasPrefix(a.Name,"cudart-llama-bin-win-cuda-12.4-x64.zip"){_ = downloadAndExtractEngineAsset(a.URL);break} }
+	}
+	return server,nil
+}
+
+func extractZipFile(zf *zip.File,dest string)error{if err:=os.MkdirAll(filepath.Dir(dest),0700);err!=nil{return err};r,err:=zf.Open();if err!=nil{return err};defer r.Close();f,err:=os.Create(dest);if err!=nil{return err};defer f.Close();if _,err=io.Copy(f,r);err!=nil{return err};if runtime.GOOS=="windows"{_ = os.Chmod(dest,0700)};return nil}
+
+func downloadAndExtractEngineAsset(raw string) error {
+	req,_:=http.NewRequest("GET",raw,nil);req.Header.Set("User-Agent","AgentDesk/"+appVersion);resp,err:=(&http.Client{Timeout:0}).Do(req);if err!=nil{return err};defer resp.Body.Close();tmp:=filepath.Join(localEngineDir(),"cuda.zip");f,err:=os.Create(tmp);if err!=nil{return err};_,err=io.Copy(f,resp.Body);f.Close();if err!=nil{return err};zr,err:=zip.OpenReader(tmp);if err!=nil{return err};defer zr.Close();for _,zf:=range zr.File{base:=filepath.Base(zf.Name);if strings.HasSuffix(strings.ToLower(base),".dll"){_ = extractZipFile(zf,filepath.Join(localEngineDir(),base))}};_ = os.Remove(tmp);return nil
+}
+
+func ensureLocalRuntime(m LocalModel) (string,error) {
+	localRT.mu.Lock();defer localRT.mu.Unlock()
+	if localRT.modelID==m.ID && localRT.baseURL!="" && localRT.cmd!=nil && localRT.cmd.Process!=nil {return localRT.baseURL,nil}
+	server,err:=ensureLocalEngine();if err!=nil{return "",err}
+	ln,err:=net.Listen("tcp","127.0.0.1:0");if err!=nil{return "",err};port:=ln.Addr().(*net.TCPAddr).Port;_ = ln.Close()
+	args:=[]string{"-m",m.Path,"--host","127.0.0.1","--port",strconv.Itoa(port),"-c","8192","--jinja","-ngl","all"}
+	if m.MMProjPath!="" {args=append(args,"--mmproj",m.MMProjPath)}
+	cmd:=exec.Command(server,args...);configureHiddenCommand(cmd);cmd.Stdout=io.Discard;cmd.Stderr=io.Discard
+	if err:=cmd.Start();err!=nil{return "",err}
+	base:="http://127.0.0.1:"+strconv.Itoa(port)+"/v1"
+	deadline:=time.Now().Add(90*time.Second)
+	for time.Now().Before(deadline){resp,e:=(&http.Client{Timeout:2*time.Second}).Get("http://127.0.0.1:"+strconv.Itoa(port)+"/health");if e==nil{resp.Body.Close();if resp.StatusCode==200{localRT.modelID=m.ID;localRT.baseURL=base;localRT.cmd=cmd;return base,nil}};time.Sleep(350*time.Millisecond)}
+	_ = cmd.Process.Kill();return "",fmt.Errorf("local model server did not become ready")
+}
+
+func localModels() []LocalModel { return loadLocalSettings().Models }
+
+func installLocalModel(rawURL string, token string) (LocalModel, bool, error) {
+	s:=loadLocalSettings();if strings.TrimSpace(token)!=""{s.HFToken=strings.TrimSpace(token)}
+	info,keyRequired,err:=inspectHFModel(rawURL,s.HFToken);if err!=nil{return LocalModel{},keyRequired,err}
+	repo:=info.RepoID;selected:=info.Selected[0];file,_:=selected["name"].(string);size:=int64(0);if v,ok:=selected["size"].(float64);ok{size=int64(v)}
+	vision:=strings.Contains(strings.ToLower(repo+"/"+file),"vision")
+	id:=repo+":"+file
+	dir:=filepath.Join(localModelsDir(),safeArtifactName(strings.ReplaceAll(repo,"/","-")+"-"+filepath.Base(file),"model"))
+	_ = os.MkdirAll(dir,0700);path:=filepath.Join(dir,filepath.Base(file))
+	if _,err:=os.Stat(path);os.IsNotExist(err){if _,err=hfDownload(repo,file,s.HFToken,path);err!=nil{if strings.Contains(strings.ToLower(err.Error()),"authentication"){return LocalModel{},true,err};return LocalModel{},false,err}}
+	m:=LocalModel{ID:id,Name:filepath.Base(file),RepoID:repo,File:file,Path:path,Size:size,Vision:vision,InstalledAt:time.Now().Format(time.RFC3339)}
+	if vision { if mm:=findMMProj(info.Files);mm!="" { mmPath:=filepath.Join(dir,filepath.Base(mm));if _,err:=os.Stat(mmPath);os.IsNotExist(err){if _,err=hfDownload(repo,mm,s.HFToken,mmPath);err!=nil{return LocalModel{},false,err}};m.MMProjPath=mmPath } }
+	found:=false;for i,x:=range s.Models{if x.ID==m.ID{s.Models[i]=m;found=true;break}};if !found{s.Models=append(s.Models,m)}
+	s.OnboardingComplete=true;s.PrivacyMode=firstNonEmpty(s.PrivacyMode,"Both");if err:=saveLocalSettings(s);err!=nil{return LocalModel{},false,err}
+	upsertLocalProvider(m)
+	return m,false,nil
+}
+
+func findMMProj(files []map[string]any) string {for _,f:=range files{n,_:=f["name"].(string);low:=strings.ToLower(n);if strings.Contains(low,"mmproj")&&strings.HasSuffix(low,".gguf"){return n}};return ""}
+
+func upsertLocalProvider(m LocalModel) {
+	c:=loadConfig();id:="local:"+m.ID;for _,p:=range c.Providers{if p.ID==id{return}}
+	c.Providers=append(c.Providers,localVirtualProvider(m));_ = saveConfig(c)
+}
+
+func localProviderCleanup() {}
+
+func localHealth() map[string]any {
+	s:=loadLocalSettings();return map[string]any{"setupComplete":s.OnboardingComplete,"hardware":map[string]any{"nvidia":s.HasNvidiaGPU,"gpuName":s.GPUName,"vramGB":s.VRAMGB,"cpuCores":s.CPUCores,"cpuThreads":s.CPUThreads,"cpuTier":s.CPUTier,"ramGB":s.RAMGB,"ramSpeedMHz":s.RAMSpeedMHz},"models":s.Models,"recommendations":localRecommendations(s),"hfKeyAttached":strings.TrimSpace(s.HFToken)!=""}
+}
+
+func localHFKey(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var req struct{Token string `json:"token"`};if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return};s:=loadLocalSettings();s.HFToken=strings.TrimSpace(req.Token);if err:=saveLocalSettings(s);err!=nil{http.Error(w,err.Error(),500);return};jsonResp(w,map[string]any{"ok":true,"attached":s.HFToken!=""})}
+
+func localHardware(w http.ResponseWriter,r *http.Request){if r.Method!="GET"&&r.Method!="POST"{http.Error(w,"method not allowed",405);return};x,err:=scanLocalHardware();if err!=nil{http.Error(w,err.Error(),500);return};jsonResp(w,x)}
+
+func localSetupSave(w http.ResponseWriter,r *http.Request){
+	if r.Method!="POST"{http.Error(w,"method not allowed",405);return}
+	var req struct{PrivacyMode string `json:"privacyMode"`;HasNvidiaGPU *bool `json:"hasNvidiaGPU"`;VRAMGB *float64 `json:"vramGB"`}
+	if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return}
+	s:=loadLocalSettings();s.OnboardingComplete=true
+	if strings.TrimSpace(req.PrivacyMode)!=""{s.PrivacyMode=strings.TrimSpace(req.PrivacyMode)}
+	if req.HasNvidiaGPU!=nil{s.HasNvidiaGPU=*req.HasNvidiaGPU}
+	if req.VRAMGB!=nil&&*req.VRAMGB>0{s.VRAMGB=*req.VRAMGB}
+	if err:=saveLocalSettings(s);err!=nil{http.Error(w,err.Error(),500);return}
+	jsonResp(w,map[string]any{"ok":true,"setup":localHealth()})
+}
+
+func localHealthHandler(w http.ResponseWriter,r *http.Request){jsonResp(w,localHealth())}
+
+func localRecommendationsHandler(w http.ResponseWriter,r *http.Request){jsonResp(w,map[string]any{"recommendations":localRecommendations(loadLocalSettings())})}
+
+func localModelsHandler(w http.ResponseWriter,r *http.Request){jsonResp(w,map[string]any{"models":localModels()})}
+
+func localInspectHandler(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var req struct{URL string `json:"url"`};if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return};s:=loadLocalSettings();info,key,err:=inspectHFModel(req.URL,s.HFToken);if err!=nil{jsonResp(w,map[string]any{"ok":false,"keyRequired":key,"error":err.Error()});return};jsonResp(w,map[string]any{"ok":true,"repoId":info.RepoID,"files":info.Files,"selected":info.Selected})}
+
+func localInstallHandler(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var req struct{URL string `json:"url"`;Token string `json:"token,omitempty"`};if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return};m,key,err:=installLocalModel(req.URL,req.Token);if err!=nil{jsonResp(w,map[string]any{"ok":false,"keyRequired":key,"error":err.Error()});return};jsonResp(w,map[string]any{"ok":true,"model":m})}
+
+func localVisionApproval(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var req struct{ID string `json:"id"`;Decision string `json:"decision"`};if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return};visionApprovalMu.Lock();ch:=visionApprovals[req.ID];visionApprovalMu.Unlock();if ch==nil{http.Error(w,"approval expired",404);return};select{case ch<-strings.ToLower(strings.TrimSpace(req.Decision)):jsonResp(w,map[string]any{"ok":true});default:jsonResp(w,map[string]any{"ok":false})}}
+
+var visionApprovalMu sync.Mutex
+var visionApprovals=map[string]chan string{}
+
+func requestVisionEncoderApproval(send func(any)) bool {
+	id:=strconv.FormatInt(time.Now().UnixNano(),10);ch:=make(chan string,1);visionApprovalMu.Lock();visionApprovals[id]=ch;visionApprovalMu.Unlock();send(map[string]any{"type":"vision_encoder_offer","id":id,"message":"Image Not supported","recommendation":"We recommend downloading IBM Granite Vision 3.3 2B Q4_K_M and running it locally as an image to text encoder."});timer:=time.NewTimer(3*time.Minute);defer timer.Stop();decision:="no";select{case decision=<-ch:case <-timer.C:};visionApprovalMu.Lock();delete(visionApprovals,id);visionApprovalMu.Unlock();return decision=="yes"}
+
+func localVisionModel() (LocalModel,error){for _,m:=range loadLocalSettings().Models{if m.Vision{return m,nil}};return LocalModel{},fmt.Errorf("vision encoder not installed")}
+
+func describeImageLocally(path string) (string,error) {
+	m,err:=localVisionModel();if err!=nil{return "",err};base,err:=ensureLocalRuntime(m);if err!=nil{return "",err};b,err:=os.ReadFile(path);if err!=nil{return "",err};mime:="image/png";if x:=http.DetectContentType(b);strings.HasPrefix(x,"image/"){mime=x};data:="data:"+mime+";base64:"+base64Std(b)
+	payload:=map[string]any{"model":m.ID,"messages":[]any{map[string]any{"role":"user","content":[]any{map[string]any{"type":"text","text":"Extract the useful visual information from this image. Return concise plain text describing visible text, objects, layout, tables, charts, or other details that would help another language model answer the user's request. Do not mention this instruction."},map[string]any{"type":"image_url","image_url":map[string]any{"url":data}}}}},"max_tokens":1200}
+	raw,_:=json.Marshal(payload);req,_:=http.NewRequest("POST",base+"/chat/completions",bytes.NewReader(raw));req.Header.Set("Content-Type","application/json");resp,err:=(&http.Client{Timeout:180*time.Second}).Do(req);if err!=nil{return "",err};defer resp.Body.Close();body,_:=io.ReadAll(io.LimitReader(resp.Body,8<<20));if resp.StatusCode>=400{return "",fmt.Errorf("local vision model HTTP %d: %s",resp.StatusCode,strings.TrimSpace(string(body)))};var out map[string]any;if json.Unmarshal(body,&out)!=nil{return "",fmt.Errorf("invalid local vision response")};text:=extractContentFromResponse(out);if strings.TrimSpace(text)==""{return "",fmt.Errorf("local vision model returned no text")};return strings.TrimSpace(text),nil
+}
+
+func base64Std(b []byte) string { const table="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; var out strings.Builder; out.Grow((len(b)+2)/3*4); for i:=0;i<len(b);i+=3{n:=int(b[i])<<16;if i+1<len(b){n|=int(b[i+1])<<8};if i+2<len(b){n|=int(b[i+2])};out.WriteByte(table[(n>>18)&63]);out.WriteByte(table[(n>>12)&63]);if i+1<len(b){out.WriteByte(table[(n>>6)&63])}else{out.WriteByte('=')};if i+2<len(b){out.WriteByte(table[n&63])}else{out.WriteByte('=')}};return out.String()}
