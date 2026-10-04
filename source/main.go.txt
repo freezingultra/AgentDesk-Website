@@ -33,7 +33,7 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-const appVersion = "37.0"
+const appVersion = "38.0"
 
 type Provider struct {
 	ID        string   `json:"id"`
@@ -105,6 +105,8 @@ var terminalApprovalMu sync.Mutex
 var terminalApprovals = map[string]chan string{}
 var codeApprovalMu sync.Mutex
 var codeApprovals = map[string]chan string{}
+var pluginApprovalMu sync.Mutex
+var pluginApprovals = map[string]chan string{}
 
 func requestTerminalApproval(send func(any), command string) string {
 	id := strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -144,6 +146,28 @@ func terminalApproval(w http.ResponseWriter, r *http.Request) {
 	default:
 		jsonResp(w, map[string]any{"ok": false, "error": "approval already answered"})
 	}
+}
+
+func requestPluginApproval(send func(any), name, args string) string {
+	id:=strconv.FormatInt(time.Now().UnixNano(),10)
+	ch:=make(chan string,1)
+	pluginApprovalMu.Lock();pluginApprovals[id]=ch;pluginApprovalMu.Unlock()
+	p,t,ok:=pluginByTool(name);label:=name
+	if ok {label=p.Name+" → "+t.Name}
+	send(map[string]any{"type":"plugin_approval","id":id,"plugin":label,"arguments":args})
+	timer:=time.NewTimer(2*time.Minute);defer timer.Stop()
+	decision:="no";select{case decision=<-ch:case <-timer.C:}
+	pluginApprovalMu.Lock();delete(pluginApprovals,id);pluginApprovalMu.Unlock()
+	return decision
+}
+func pluginApproval(w http.ResponseWriter,r *http.Request){
+	var req struct{ID string `json:"id"`;Decision string `json:"decision"`}
+	if readJSON(r,&req)!=nil{http.Error(w,"invalid request",400);return}
+	req.ID=strings.TrimSpace(req.ID);req.Decision=strings.ToLower(strings.TrimSpace(req.Decision))
+	if req.ID==""||(req.Decision!="once"&&req.Decision!="no"&&req.Decision!="always"){http.Error(w,"invalid approval",400);return}
+	pluginApprovalMu.Lock();ch:=pluginApprovals[req.ID];pluginApprovalMu.Unlock()
+	if ch==nil{http.Error(w,"approval request expired",404);return}
+	select{case ch<-req.Decision:jsonResp(w,map[string]any{"ok":true});default:jsonResp(w,map[string]any{"ok":false,"error":"approval already answered"})}
 }
 
 func requestCodeApproval(send func(any), language, code string) string {
@@ -439,6 +463,7 @@ func agentToolsForProvider(p Provider, allowTerminal bool, allowWeb bool) []map[
 	}
 	// Terminal is always available to the agent; individual commands are approved at execution time.
 	tools = append(tools, localAgentToolDefinitions(true)...)
+	tools = append(tools, pluginToolDefinitions()...)
 	return tools
 }
 
@@ -1393,14 +1418,14 @@ func chatWithTools(p Provider, msgs []map[string]any, agent bool, max int, progr
 				}
 				result = fetchPage(a.URL)
 			default:
-				localResult, label, localErr := executeAgentLocalTool(name, args, allowTerminal)
-				if localErr != nil {
-					result = map[string]any{"ok": false, "error": localErr.Error()}
+				if _,_,ok:=pluginByTool(name); ok {
+					localResult, label, localErr := executePluginTool(name,args)
+					if localErr != nil { result=map[string]any{"ok":false,"error":localErr.Error()} } else { result=localResult }
+					if progress != nil && label != "" { progress(label) }
 				} else {
-					result = localResult
-				}
-				if progress != nil && label != "" {
-					progress(label)
+					localResult, label, localErr := executeAgentLocalTool(name, args, allowTerminal)
+					if localErr != nil { result = map[string]any{"ok": false, "error": localErr.Error()} } else { result = localResult }
+					if progress != nil && label != "" { progress(label) }
 				}
 			}
 			rb, _ := json.Marshal(result)
@@ -2224,6 +2249,7 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 	req.AllowTerminal = true
 	terminalAlways := strings.EqualFold(strings.TrimSpace(req.TerminalApprovalMode), "always")
 	codeAlways := false
+	pluginAlways := false
 	tools := agentToolsForProvider(p, true, shouldOfferWebTools(lastUser, req.Research))
 	webSearchCalls := 0
 	const maxRegularWebSearches = 5
@@ -2303,46 +2329,40 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 				_ = json.Unmarshal([]byte(args), &a)
 				command := strings.TrimSpace(a.Command)
 				terminalLabel := "Terminal: " + command
-				if strings.TrimSpace(a.CWD) != "" {
-					terminalLabel += "  [" + strings.TrimSpace(a.CWD) + "]"
-				}
-				if command == "" {
-					result = map[string]any{"ok": false, "error": "Empty command."}
-					break
-				}
+				if strings.TrimSpace(a.CWD) != "" { terminalLabel += "  [" + strings.TrimSpace(a.CWD) + "]" }
+				if command == "" { result = map[string]any{"ok": false, "error": "Empty command."}; break }
 				if !terminalAlways {
 					decision := requestTerminalApproval(send, command)
 					if decision == "always" { terminalAlways = true }
-					if decision == "no" {
-						result = map[string]any{"ok": false, "error": "User denied terminal command execution."}
-						break
-					}
+					if decision == "no" { result = map[string]any{"ok": false, "error": "User denied terminal command execution."}; break }
 				}
 				send(map[string]string{"type": "tool", "text": terminalLabel})
 				result = runTerminalCommand(a)
 			case "code_run":
 				var a struct{Language string;Code string}
 				_ = json.Unmarshal([]byte(args), &a)
-				decision:="always"
-				if !codeAlways { decision=requestCodeApproval(send,a.Language,a.Code) }
-				if decision=="always" { codeAlways=true }
-				if decision=="no" {
-					result=map[string]any{"ok":false,"error":"User denied local code execution."}
-					break
-				}
+				decision := "always"
+				if !codeAlways { decision = requestCodeApproval(send,a.Language,a.Code) }
+				if decision == "always" { codeAlways = true }
+				if decision == "no" { result = map[string]any{"ok":false,"error":"User denied local code execution."}; break }
 				send(map[string]any{"type":"tool","text":"Code runner: "+strings.TrimSpace(a.Language)+" (temporary workspace)"})
 				localResult,label,localErr:=executeAgentLocalTool(name,args,true)
-				if localErr!=nil{result=map[string]any{"ok":false,"error":localErr.Error()}}else{result=localResult}
-				if label!=""{send(map[string]any{"type":"tool","text":label})}
+				if localErr!=nil { result=map[string]any{"ok":false,"error":localErr.Error()} } else { result=localResult }
+				if label!="" { send(map[string]any{"type":"tool","text":label}) }
 			default:
-				localResult, label, localErr := executeAgentLocalTool(name, args, req.AllowTerminal)
-				if localErr != nil {
-					result = map[string]any{"ok": false, "error": localErr.Error()}
+				if _,_,ok:=pluginByTool(name); ok {
+					if !pluginAlways {
+						decision := requestPluginApproval(send,name,args)
+						if decision=="always" { pluginAlways=true }
+						if decision=="no" { result=map[string]any{"ok":false,"error":"User denied plugin execution."}; break }
+					}
+					localResult,label,localErr:=executePluginTool(name,args)
+					if localErr!=nil { result=map[string]any{"ok":false,"error":localErr.Error()} } else { result=localResult }
+					if label!="" { send(map[string]any{"type":"tool","text":label}) }
 				} else {
-					result = localResult
-				}
-				if label != "" {
-					send(map[string]any{"type": "tool", "text": label})
+					localResult,label,localErr:=executeAgentLocalTool(name,args,req.AllowTerminal)
+					if localErr!=nil { result=map[string]any{"ok":false,"error":localErr.Error()} } else { result=localResult }
+					if label!="" { send(map[string]any{"type":"tool","text":label}) }
 				}
 			}
 			rb, _ := json.Marshal(result)
@@ -3829,6 +3849,12 @@ func startupServer() string {
 	mux.HandleFunc("/api/terminal-run", terminalRun)
 	mux.HandleFunc("/api/terminal-approval", terminalApproval)
 	mux.HandleFunc("/api/code-approval", codeApproval)
+	mux.HandleFunc("/api/plugin-approval", pluginApproval)
+	mux.HandleFunc("/api/plugins", pluginListHandler)
+	mux.HandleFunc("/api/plugins/save", pluginSaveHandler)
+	mux.HandleFunc("/api/plugins/delete", pluginDeleteHandler)
+	mux.HandleFunc("/api/plugins/discover", pluginDiscoverHandler)
+	mux.HandleFunc("/api/plugins/test", pluginTestHandler)
 	mux.HandleFunc("/api/groq/transcribe", groqTranscribe)
 	mux.HandleFunc("/api/audio/transcribe", transcribeWithProvider)
 	mux.HandleFunc("/api/audio/models", audioModels)
