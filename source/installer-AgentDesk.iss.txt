@@ -1,8 +1,8 @@
 #define AppName "AgentDesk"
-#define AppVersion "37.0"
+#define AppVersion "38.0"
 #define AppPublisher "AgentDesk"
 #define AppExeName "AgentDesk.exe"
-#define AppSourceExe "..\release-assets\AgentDesk-v37.0.exe"
+#define AppSourceExe "..\release-assets\AgentDesk-v38.0.exe"
 
 [Setup]
 AppId={{D0B5F8C9-8C3A-4BE9-A0D2-1234567890AB}
@@ -12,7 +12,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\Programs\AgentDesk
 DefaultGroupName=AgentDesk
 OutputDir=..\release-assets
-OutputBaseFilename=AgentDesk-Setup-v37.0
+OutputBaseFilename=AgentDesk-Setup-v38.0
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
