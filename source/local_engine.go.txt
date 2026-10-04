@@ -436,7 +436,7 @@ func findMMProj(files []map[string]any) string {for _,f:=range files{n,_:=f["nam
 
 func upsertLocalProvider(m LocalModel) {
 	c:=loadConfig();id:="local:"+m.ID
-	for i,p:=range c.Providers{if p.ID==id{return}}
+	for _,p:=range c.Providers{if p.ID==id{return}}
 	c.Providers=append(c.Providers,localVirtualProvider(m));_ = saveConfig(c)
 }
 
