@@ -34,10 +34,10 @@ try {
   $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
   if (Test-Path $iscc) {
     New-Item -ItemType Directory -Path (Join-Path $buildDir "release-assets") -Force | Out-Null
-    Copy-Item .\AgentDesk.exe (Join-Path $buildDir "release-assets\AgentDesk-v36.0.exe") -Force
+    Copy-Item .\AgentDesk.exe (Join-Path $buildDir "release-assets\AgentDesk-v37.0.exe") -Force
     Copy-Item (Join-Path $root "source\installer-AgentDesk.iss.txt") (Join-Path $buildDir "installer-AgentDesk.iss") -Force
     $iss = Get-Content (Join-Path $buildDir "installer-AgentDesk.iss") -Raw
-    $iss = $iss.Replace('..\release-assets\AgentDesk-v36.0.exe','release-assets\AgentDesk-v36.0.exe').Replace('..\LICENSE-SOURCE-AVAILABLE.md','LICENSE-SOURCE-AVAILABLE.md').Replace('..\release-assets','release-assets')
+    $iss = $iss.Replace('..\release-assets\AgentDesk-v37.0.exe','release-assets\AgentDesk-v37.0.exe').Replace('..\LICENSE-SOURCE-AVAILABLE.md','LICENSE-SOURCE-AVAILABLE.md').Replace('..\release-assets','release-assets')
     Set-Content (Join-Path $buildDir "installer-AgentDesk.iss") $iss -NoNewline
     & $iscc (Join-Path $buildDir "installer-AgentDesk.iss")
     Write-Host "Installer build complete."
