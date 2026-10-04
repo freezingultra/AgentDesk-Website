@@ -375,23 +375,53 @@ func ensureLocalEngine() (string,error) {
 	server := filepath.Join(localEngineDir(),"llama-server"+ext)
 	if _,err:=os.Stat(server);err==nil{return server,nil}
 	if runtime.GOOS!="windows" { return "",fmt.Errorf("AgentDesk Local Engine bootstrap currently supports Windows builds; the model manager is ready for other platforms") }
-	req,_:=http.NewRequest("GET","https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",nil);req.Header.Set("User-Agent","AgentDesk/"+appVersion)
-	resp,err:=(&http.Client{Timeout:30*time.Second}).Do(req);if err!=nil{return "",err};defer resp.Body.Close();body,_:=io.ReadAll(io.LimitReader(resp.Body,16<<20));if resp.StatusCode>=400{return "",fmt.Errorf("local engine release lookup failed: HTTP %d",resp.StatusCode)}
-	var rel struct{TagName string `json:"tag_name"`;Assets []struct{Name string `json:"name"`;URL string `json:"browser_download_url"`} `json:"assets"`}
-	if json.Unmarshal(body,&rel)!=nil{return "",fmt.Errorf("invalid local engine release metadata")}
-	wantCPU, wantCUDA := "llama-"+rel.TagName+"-bin-win-cpu-x64.zip", "llama-"+rel.TagName+"-bin-win-cuda-12.4-x64.zip"
-	asset := ""; for _,a:=range rel.Assets{if a.Name==wantCUDA && loadLocalSettings().HasNvidiaGPU{asset=a.URL;break};if a.Name==wantCPU{if asset==""{asset=a.URL}}}
-	if asset==""{return "",fmt.Errorf("no Windows x64 Local Engine build was found in llama.cpp release %s",rel.TagName)}
-	zipPath:=filepath.Join(localEngineDir(),"engine.zip");req,_=http.NewRequest("GET",asset,nil);req.Header.Set("User-Agent","AgentDesk/"+appVersion);resp,err=(&http.Client{Timeout:0}).Do(req);if err!=nil{return "",err};defer resp.Body.Close();f,err:=os.Create(zipPath);if err!=nil{return "",err};_,err=io.Copy(f,resp.Body);f.Close();if err!=nil{return "",err}
-	zr,err:=zip.OpenReader(zipPath);if err!=nil{return "",err};defer zr.Close();for _,zf:=range zr.File{if zf.FileInfo().IsDir(){continue};base:=filepath.Base(zf.Name);if base==""{continue};if err:=extractZipFile(zf,filepath.Join(localEngineDir(),base));err!=nil{return "",err}}
-	if _,err:=os.Stat(server);err!=nil{return "",fmt.Errorf("local engine archive did not contain llama-server.exe")}
+
+	// llama.cpp's stable v0.5.0 release may not publish the Windows binary assets directly.
+	// Prefer the newest release that actually contains a Windows x64 package instead of
+	// assuming the API's /releases/latest tag has downloadable binaries.
+	req,_:=http.NewRequest("GET","https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30",nil)
+	req.Header.Set("User-Agent","AgentDesk/"+appVersion)
+	resp,err:=(&http.Client{Timeout:30*time.Second}).Do(req);if err!=nil{return "",err}
+	defer resp.Body.Close()
+	body,_:=io.ReadAll(io.LimitReader(resp.Body,32<<20))
+	if resp.StatusCode>=400{return "",fmt.Errorf("local engine release lookup failed: HTTP %d",resp.StatusCode)}
+	var releases []struct{TagName string `json:"tag_name"`;Assets []struct{Name string `json:"name"`;URL string `json:"browser_download_url"`} `json:"assets"`}
+	if json.Unmarshal(body,&releases)!=nil{return "",fmt.Errorf("invalid local engine release metadata")}
+
+	asset,tag,cudaAsset := "","",""
+	for _,rel:=range releases {
+		cpu,cuda:="",""
+		for _,a:=range rel.Assets {
+			if strings.HasSuffix(a.Name,"-bin-win-cpu-x64.zip"){cpu=a.URL}
+			if strings.HasSuffix(a.Name,"-bin-win-cuda-13.4-x64.zip") && loadLocalSettings().HasNvidiaGPU{cuda=a.URL}
+			if strings.HasSuffix(a.Name,"-bin-win-cuda-12.4-x64.zip") && loadLocalSettings().HasNvidiaGPU && cuda==""{cuda=a.URL}
+		}
+		if cpu!="" {
+			asset,tag,cudaAsset=cpu,rel.TagName,cuda
+			if cuda!=""{asset=cuda}
+			break
+		}
+	}
+	if asset==""{return "",fmt.Errorf("no Windows x64 Local Engine build was found in llama.cpp releases")}
+
+	zipPath:=filepath.Join(localEngineDir(),"engine.zip")
+	req,_=http.NewRequest("GET",asset,nil);req.Header.Set("User-Agent","AgentDesk/"+appVersion)
+	resp,err=(&http.Client{Timeout:0}).Do(req);if err!=nil{return "",err}
+	defer resp.Body.Close()
+	if resp.StatusCode>=400{return "",fmt.Errorf("local engine download failed: HTTP %d",resp.StatusCode)}
+	f,err:=os.Create(zipPath);if err!=nil{return "",err}
+	_,err=io.Copy(f,resp.Body);f.Close();if err!=nil{return "",err}
+	zr,err:=zip.OpenReader(zipPath);if err!=nil{return "",err};defer zr.Close()
+	for _,zf:=range zr.File{if zf.FileInfo().IsDir(){continue};base:=filepath.Base(zf.Name);if base==""{continue};if err:=extractZipFile(zf,filepath.Join(localEngineDir(),base));err!=nil{return "",err}}
+	if _,err:=os.Stat(server);err!=nil{return "",fmt.Errorf("llama.cpp %s archive did not contain llama-server.exe",tag)}
 	_ = os.Remove(zipPath)
-	if loadLocalSettings().HasNvidiaGPU {
-		for _,a:=range rel.Assets { if strings.HasPrefix(a.Name,"cudart-llama-bin-win-cuda-12.4-x64.zip"){_ = downloadAndExtractEngineAsset(a.URL);break} }
+
+	// If we selected the CUDA package, its runtime DLLs are normally shipped separately.
+	if cudaAsset!="" {
+		_ = downloadAndExtractEngineAsset(cudaAsset)
 	}
 	return server,nil
 }
-
 func extractZipFile(zf *zip.File,dest string)error{if err:=os.MkdirAll(filepath.Dir(dest),0700);err!=nil{return err};r,err:=zf.Open();if err!=nil{return err};defer r.Close();f,err:=os.Create(dest);if err!=nil{return err};defer f.Close();if _,err=io.Copy(f,r);err!=nil{return err};if runtime.GOOS=="windows"{_ = os.Chmod(dest,0700)};return nil}
 
 func downloadAndExtractEngineAsset(raw string) error {
