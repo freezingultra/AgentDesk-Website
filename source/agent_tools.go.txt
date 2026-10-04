@@ -31,7 +31,7 @@ func localAgentToolDefinitions(allowTerminal bool) []map[string]any {
 			map[string]any{"type":"function","function":map[string]any{"name":"workspace_list","description":"List files and directories in a local workspace.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"}}}}},
 			map[string]any{"type":"function","function":map[string]any{"name":"workspace_search","description":"Search text across files in a local workspace.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"},"query":map[string]any{"type":"string"}},"required":[]string{"query"}}}},
 			map[string]any{"type":"function","function":map[string]any{"name":"file_write","description":"Create or update a text or code file inside the user's home directory.","parameters":map[string]any{"type":"object","properties":map[string]any{"path":map[string]any{"type":"string"},"content":map[string]any{"type":"string"}},"required":[]string{"path","content"}}}},
-			map[string]any{"type":"function","function":map[string]any{"name":"code_run","description":"Run Python, JavaScript/Node or Go code locally and return stdout/stderr.","parameters":map[string]any{"type":"object","properties":map[string]any{"language":map[string]any{"type":"string"},"code":map[string]any{"type":"string"}},"required":[]string{"language","code"}}}},
+			map[string]any{"type":"function","function":map[string]any{"name":"code_run","description":"Run Python, JavaScript/Node or Go code in a temporary disposable workspace. Temporary files are removed after execution. Use this for deterministic local analysis, not as a substitute for visual understanding.","parameters":map[string]any{"type":"object","properties":map[string]any{"language":map[string]any{"type":"string"},"code":map[string]any{"type":"string"}},"required":[]string{"language","code"}}}},
 		)
 	}
 	return tools
@@ -239,11 +239,12 @@ func searchWorkspace(root,query string) []map[string]any {
 
 func runLocalCode(language,code string)(map[string]any,error){
 	if strings.TrimSpace(code)==""{return nil,fmt.Errorf("code is empty")};if len(code)>200000{return nil,fmt.Errorf("code is too large")}
-	dir:=filepath.Join(dataDir(),"agent-runs");if err:=os.MkdirAll(dir,0700);err!=nil{return nil,err}
+	dir,err:=os.MkdirTemp("", "agentdesk-code-*");if err!=nil{return nil,err}
+	defer os.RemoveAll(dir)
 	lang:=strings.ToLower(strings.TrimSpace(language));ext:=".txt";var cmd *exec.Cmd
 	switch lang{case "python","py":ext=".py";cmd=exec.Command("python");case "javascript","js","node":ext=".js";cmd=exec.Command("node");case "go","golang":ext=".go";cmd=exec.Command("go","run");default:return nil,fmt.Errorf("supported languages: Python, JavaScript/Node, Go")}
 	file:=filepath.Join(dir,fmt.Sprintf("run-%d%s",time.Now().UnixNano(),ext));if err:=os.WriteFile(file,[]byte(code),0600);err!=nil{return nil,err};cmd.Args=append(cmd.Args,file)
-	ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second);defer cancel();cmd=exec.CommandContext(ctx,cmd.Path,cmd.Args[1:]...);cmd.Dir=dir;configureHiddenCommand(cmd);var out bytes.Buffer;cmd.Stdout=&out;cmd.Stderr=&out;err:=cmd.Run();if ctx.Err()==context.DeadlineExceeded{return map[string]any{"ok":false,"output":"Execution timed out after 15 seconds."},nil};return map[string]any{"ok":err==nil,"output":truncateText(out.String(),30000)},nil
+	ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second);defer cancel();cmd=exec.CommandContext(ctx,cmd.Path,cmd.Args[1:]...);cmd.Dir=dir;configureHiddenCommand(cmd);var out bytes.Buffer;cmd.Stdout=&out;cmd.Stderr=&out;err=cmd.Run();if ctx.Err()==context.DeadlineExceeded{return map[string]any{"ok":false,"output":"Execution timed out after 15 seconds."},nil};return map[string]any{"ok":err==nil,"output":truncateText(out.String(),30000),"temporaryWorkspace":true},nil
 }
 
 func memorySearch(query string,limit int) []Memory {
