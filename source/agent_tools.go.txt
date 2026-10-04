@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"archive/zip"
 	"bytes"
 	"context"
@@ -9,13 +10,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -268,25 +272,7 @@ func containsImageToken(list []string)bool{for _,x:=range list{if strings.Contai
 func visionNameHeuristic(model string)bool{m:=strings.ToLower(model);for _,x:=range []string{"vision","vl","gpt-4o","gpt-4.1","gemini","gemma-3","claude-3","claude-sonnet-4","pixtral","llava","qwen2-vl","qwen2.5-vl","qwen3-vl"}{if strings.Contains(m,x){return true}};return false}
 
 
-// Plugin Center implementation is included in this public snapshot for single-file source builds.
-package main
-
-import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
-	"path/filepath"
-	"regexp"
-	"strings"
-	"sync"
-	"time"
-)
-
+// Plugin Center implementation for the public single-file source snapshot.
 type PluginTool struct {
 	Name           string         `json:"name"`
 	Description    string         `json:"description"`
