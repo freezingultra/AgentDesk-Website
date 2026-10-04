@@ -33,7 +33,7 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-const appVersion = "36.0"
+const appVersion = "37.0"
 
 type Provider struct {
 	ID        string   `json:"id"`
@@ -103,6 +103,8 @@ var researchJobs = map[string]*ResearchJob{}
 
 var terminalApprovalMu sync.Mutex
 var terminalApprovals = map[string]chan string{}
+var codeApprovalMu sync.Mutex
+var codeApprovals = map[string]chan string{}
 
 func requestTerminalApproval(send func(any), command string) string {
 	id := strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -142,6 +144,30 @@ func terminalApproval(w http.ResponseWriter, r *http.Request) {
 	default:
 		jsonResp(w, map[string]any{"ok": false, "error": "approval already answered"})
 	}
+}
+
+func requestCodeApproval(send func(any), language, code string) string {
+	id:=strconv.FormatInt(time.Now().UnixNano(),10)
+	ch:=make(chan string,1)
+	codeApprovalMu.Lock();codeApprovals[id]=ch;codeApprovalMu.Unlock()
+	preview:=strings.TrimSpace(code)
+	if len(preview)>12000{preview=preview[:12000]+"\n[code preview truncated]"}
+	send(map[string]any{"type":"code_approval","id":id,"language":language,"code":preview})
+	timer:=time.NewTimer(2*time.Minute);defer timer.Stop()
+	decision:="no"
+	select{case decision=<-ch:case <-timer.C:}
+	codeApprovalMu.Lock();delete(codeApprovals,id);codeApprovalMu.Unlock()
+	return decision
+}
+
+func codeApproval(w http.ResponseWriter,r *http.Request){
+	var req struct{ID string;Decision string}
+	if readJSON(r,&req)!=nil{http.Error(w,"invalid request",400);return}
+	req.ID=strings.TrimSpace(req.ID);req.Decision=strings.ToLower(strings.TrimSpace(req.Decision))
+	if req.ID==""||(req.Decision!="once"&&req.Decision!="no"&&req.Decision!="always"){http.Error(w,"invalid approval",400);return}
+	codeApprovalMu.Lock();ch:=codeApprovals[req.ID];codeApprovalMu.Unlock()
+	if ch==nil{http.Error(w,"approval request expired",404);return}
+	select{case ch<-req.Decision:jsonResp(w,map[string]any{"ok":true});default:jsonResp(w,map[string]any{"ok":false,"error":"approval already answered"})}
 }
 
 func newResearchJob() *ResearchJob {
@@ -2197,6 +2223,7 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 	// Terminal is always available to the agent; command execution is approval-gated.
 	req.AllowTerminal = true
 	terminalAlways := strings.EqualFold(strings.TrimSpace(req.TerminalApprovalMode), "always")
+	codeAlways := false
 	tools := agentToolsForProvider(p, true, shouldOfferWebTools(lastUser, req.Research))
 	webSearchCalls := 0
 	const maxRegularWebSearches = 5
@@ -2293,6 +2320,20 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 				}
 				send(map[string]string{"type": "tool", "text": terminalLabel})
 				result = runTerminalCommand(a)
+			case "code_run":
+				var a struct{Language string;Code string}
+				_ = json.Unmarshal([]byte(args), &a)
+				decision:="always"
+				if !codeAlways { decision=requestCodeApproval(send,a.Language,a.Code) }
+				if decision=="always" { codeAlways=true }
+				if decision=="no" {
+					result=map[string]any{"ok":false,"error":"User denied local code execution."}
+					break
+				}
+				send(map[string]any{"type":"tool","text":"Code runner: "+strings.TrimSpace(a.Language)+" (temporary workspace)"})
+				localResult,label,localErr:=executeAgentLocalTool(name,args,true)
+				if localErr!=nil{result=map[string]any{"ok":false,"error":localErr.Error()}}else{result=localResult}
+				if label!=""{send(map[string]any{"type":"tool","text":label})}
 			default:
 				localResult, label, localErr := executeAgentLocalTool(name, args, req.AllowTerminal)
 				if localErr != nil {
@@ -2301,7 +2342,7 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 					result = localResult
 				}
 				if label != "" {
-					send(map[string]string{"type": "tool", "text": label})
+					send(map[string]any{"type": "tool", "text": label})
 				}
 			}
 			rb, _ := json.Marshal(result)
@@ -3787,6 +3828,7 @@ func startupServer() string {
 	mux.HandleFunc("/api/terminal-info", terminalInfo)
 	mux.HandleFunc("/api/terminal-run", terminalRun)
 	mux.HandleFunc("/api/terminal-approval", terminalApproval)
+	mux.HandleFunc("/api/code-approval", codeApproval)
 	mux.HandleFunc("/api/groq/transcribe", groqTranscribe)
 	mux.HandleFunc("/api/audio/transcribe", transcribeWithProvider)
 	mux.HandleFunc("/api/audio/models", audioModels)
