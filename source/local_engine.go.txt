@@ -80,6 +80,9 @@ func localEngineDir() string { d := filepath.Join(localDir(), "engine"); _ = os.
 
 func loadLocalSettings() LocalSettings {
 	c := loadConfig()
+	if strings.TrimSpace(c.Local.HFToken)=="" {
+		c.Local.HFToken=firstNonEmpty(os.Getenv("HF_TOKEN"),os.Getenv("HUGGING_FACE_HUB_TOKEN"))
+	}
 	return c.Local
 }
 
@@ -122,21 +125,55 @@ func detectExistingLocalModels() []LocalModel {
  s:=loadLocalSettings()
  out:=append([]LocalModel(nil),s.Models...)
  seen:=map[string]bool{}
- for _,m:=range out{seen[m.Path]=true}
+ for _,m:=range out{if strings.TrimSpace(m.Path)!=""{seen[m.Path]=true}}
  home,_:=os.UserHomeDir()
- for _,root:=range []string{filepath.Join(home,"Downloads"),filepath.Join(home,"models"),filepath.Join(home,"Documents","Models")}{
-  entries,err:=os.ReadDir(root);if err!=nil{continue}
-  for _,e:=range entries{
-   if e.IsDir()||!strings.HasSuffix(strings.ToLower(e.Name()),".gguf"){continue}
-   p:=filepath.Join(root,e.Name());if seen[p]{continue}
-   info,err:=e.Info();if err!=nil{continue}
-   id:="localfile:"+fmt.Sprintf("%x",sha256.Sum256([]byte(p)))
-   out=append(out,LocalModel{ID:id,Name:e.Name(),RepoID:"Local file",File:e.Name(),Path:p,Size:info.Size(),Vision:strings.Contains(strings.ToLower(e.Name()),"vision"),InstalledAt:time.Now().Format(time.RFC3339)})
-   seen[p]=true
+ roots:=[]string{
+  filepath.Join(home,"Downloads"),
+  filepath.Join(home,"models"),
+  filepath.Join(home,"Documents","Models"),
+  filepath.Join(home,".cache","huggingface","hub"),
+  filepath.Join(home,".cache","lm-studio","models"),
+ }
+ if v:=strings.TrimSpace(os.Getenv("HF_HUB_CACHE"));v!=""{roots=append(roots,v)}
+ if v:=strings.TrimSpace(os.Getenv("HUGGINGFACE_HUB_CACHE"));v!=""{roots=append(roots,v)}
+ if v:=strings.TrimSpace(os.Getenv("TRANSFORMERS_CACHE"));v!=""{roots=append(roots,v)}
+ if v:=strings.TrimSpace(os.Getenv("PYTORCH_TRANSFORMERS_CACHE"));v!=""{roots=append(roots,v)}
+ if v:=strings.TrimSpace(os.Getenv("PYTORCH_PRETRAINED_BERT_CACHE"));v!=""{roots=append(roots,v)}
+ if v:=strings.TrimSpace(os.Getenv("HF_HOME"));v!=""{roots=append(roots,filepath.Join(v,"hub"))}
+ if runtime.GOOS=="windows" {
+  if local:=strings.TrimSpace(os.Getenv("LOCALAPPDATA"));local!=""{
+   roots=append(roots,filepath.Join(local,"huggingface","hub"),filepath.Join(local,"LM-Studio","models"))
   }
+ }
+ roots=uniqueExistingPaths(roots)
+ addFile:=func(p string, info os.FileInfo){
+  if seen[p]||info==nil||!strings.HasSuffix(strings.ToLower(info.Name()),".gguf"){return}
+  low:=strings.ToLower(info.Name())
+  id:="localfile:"+fmt.Sprintf("%x",sha256.Sum256([]byte(p)))
+  repo:="Local file"
+  if i:=strings.Index(strings.ToLower(p),"models--");i>=0{
+   tail:=p[i+len("models--"):]
+   if j:=strings.Index(tail,string(os.PathSeparator));j>0{repo="Hugging Face · "+strings.ReplaceAll(tail[:j],"--","/")}
+  }
+  out=append(out,LocalModel{ID:id,Name:info.Name(),RepoID:repo,File:info.Name(),Path:p,Size:info.Size(),Vision:strings.Contains(low,"vision")||strings.Contains(low,"vl")||strings.Contains(low,"mmproj"),InstalledAt:time.Now().Format(time.RFC3339)})
+  seen[p]=true
+ }
+ for _,root:=range roots{
+  _=filepath.WalkDir(root,func(path string,d os.DirEntry,err error)error{
+   if err!=nil{return nil}
+   if d.IsDir(){
+    rel,_:=filepath.Rel(root,path)
+    if rel!="."&&strings.Count(rel,string(os.PathSeparator))>6{return filepath.SkipDir}
+    return nil
+   }
+   if strings.HasSuffix(strings.ToLower(d.Name()),".gguf"){if info,e:=d.Info();e==nil{addFile(path,info)}}
+   if len(out)>=200{return filepath.SkipDir}
+   return nil
+  })
  }
  return out
 }
+func uniqueExistingPaths(paths []string)[]string{seen:=map[string]bool{};out:=[]string{};for _,p:=range paths{p=strings.TrimSpace(p);if p==""||seen[p]{continue};if st,err:=os.Stat(p);err==nil&&st.IsDir(){seen[p]=true;out=append(out,p)}};return out}
 
 func scanLocalHardware() (map[string]any, error) {
 	cores := runtime.NumCPU()
@@ -254,7 +291,13 @@ func localRecommendations(s LocalSettings) []LocalRecommendation {
 func normalizeHFRepo(raw string) (repo, file string, err error) {
 	x := strings.TrimSpace(raw)
 	if x == "" { return "", "", fmt.Errorf("model URL is required") }
-	if !strings.Contains(x, "://") && strings.Count(x, "/") == 1 { return x, "", nil }
+	if strings.HasPrefix(strings.ToLower(x),"hf://") {
+		x=strings.TrimPrefix(x,"hf://")
+	}
+	if !strings.Contains(x, "://") && strings.Count(x, "/") >= 1 {
+		parts:=strings.Split(strings.Trim(x,"/"),"/")
+		if len(parts)>=2{return parts[0]+"/"+parts[1],strings.Join(parts[2:],"/"),nil}
+	}
 	u, e := url.Parse(x); if e != nil { return "", "", fmt.Errorf("invalid model URL") }
 	if !strings.EqualFold(u.Hostname(), "huggingface.co") { return "", "", fmt.Errorf("model URL must point to huggingface.co") }
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
@@ -262,7 +305,10 @@ func normalizeHFRepo(raw string) (repo, file string, err error) {
 	if len(parts) < 2 { return "", "", fmt.Errorf("use a Hugging Face model URL such as https://huggingface.co/org/model") }
 	repo = parts[0] + "/" + parts[1]
 	for i := 2; i < len(parts); i++ {
-		if parts[i] == "resolve" || parts[i] == "blob" { if i+2 < len(parts) { file = strings.Join(parts[i+2:], "/") }; break }
+		if parts[i] == "resolve" || parts[i] == "blob" || parts[i] == "raw" {
+			if i+2 < len(parts) { file = strings.Join(parts[i+2:], "/") }
+			break
+		}
 	}
 	return repo, file, nil
 }
@@ -276,7 +322,7 @@ func hfRequest(path, token string) (*http.Response, error) {
 
 func inspectHFModel(rawURL, token string) (LocalModelInfo, bool, error) {
 	repo, direct, err := normalizeHFRepo(rawURL); if err != nil { return LocalModelInfo{}, false, err }
-	resp, err := hfRequest("/api/models/"+url.PathEscape(repo), token); if err != nil { return LocalModelInfo{}, false, err }
+	resp, err := hfRequest("/api/models/"+repo, token); if err != nil { return LocalModelInfo{}, false, err }
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if resp.StatusCode == 401 || resp.StatusCode == 403 { return LocalModelInfo{}, true, fmt.Errorf("Hugging Face requires authentication for this model") }
@@ -389,7 +435,8 @@ func installLocalModel(rawURL string, token string) (LocalModel, bool, error) {
 func findMMProj(files []map[string]any) string {for _,f:=range files{n,_:=f["name"].(string);low:=strings.ToLower(n);if strings.Contains(low,"mmproj")&&strings.HasSuffix(low,".gguf"){return n}};return ""}
 
 func upsertLocalProvider(m LocalModel) {
-	c:=loadConfig();id:="local:"+m.ID;for _,p:=range c.Providers{if p.ID==id{return}}
+	c:=loadConfig();id:="local:"+m.ID
+	for i,p:=range c.Providers{if p.ID==id{return}}
 	c.Providers=append(c.Providers,localVirtualProvider(m));_ = saveConfig(c)
 }
 
