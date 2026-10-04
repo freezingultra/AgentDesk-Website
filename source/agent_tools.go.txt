@@ -266,3 +266,163 @@ func boolField(m map[string]any,key string)(bool,bool){v,ok:=m[key];if !ok{retur
 func stringListField(m map[string]any,key string)[]string{v,ok:=m[key];if !ok{return nil};switch x:=v.(type){case []any:out:=[]string{};for _,a:=range x{if s,ok:=a.(string);ok{out=append(out,strings.ToLower(s))}};return out;case []string:return x;default:return nil}}
 func containsImageToken(list []string)bool{for _,x:=range list{if strings.Contains(strings.ToLower(x),"image"){return true}};return false}
 func visionNameHeuristic(model string)bool{m:=strings.ToLower(model);for _,x:=range []string{"vision","vl","gpt-4o","gpt-4.1","gemini","gemma-3","claude-3","claude-sonnet-4","pixtral","llava","qwen2-vl","qwen2.5-vl","qwen3-vl"}{if strings.Contains(m,x){return true}};return false}
+
+
+// Plugin Center implementation is included in this public snapshot for single-file source builds.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+type PluginTool struct {
+	Name           string         `json:"name"`
+	Description    string         `json:"description"`
+	Kind           string         `json:"kind,omitempty"`
+	Method         string         `json:"method,omitempty"`
+	URL            string         `json:"url,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	BodyTemplate   string         `json:"bodyTemplate,omitempty"`
+	Parameters     map[string]any `json:"parameters,omitempty"`
+	RequiresApproval bool         `json:"requiresApproval,omitempty"`
+}
+
+type Plugin struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	Kind        string            `json:"kind"`
+	URL         string            `json:"url,omitempty"`
+	APIKey      string            `json:"apiKey,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Enabled     bool              `json:"enabled"`
+	Tools       []PluginTool      `json:"tools,omitempty"`
+	CreatedAt   string            `json:"createdAt,omitempty"`
+}
+
+var pluginMu sync.Mutex
+
+func pluginDir() string { d:=filepath.Join(dataDir(),"plugins"); _=os.MkdirAll(d,0700); return d }
+func pluginPath(id string) string { return filepath.Join(pluginDir(),safePluginID(id)+".json") }
+func safePluginID(id string) string { id=strings.ToLower(strings.TrimSpace(id)); id=regexp.MustCompile(`[^a-z0-9_-]+`).ReplaceAllString(id,"-"); if id==""{id="plugin"}; if len(id)>48{id=id[:48]}; return id }
+
+func loadPlugins() []Plugin {
+	entries,_:=os.ReadDir(pluginDir());out:=[]Plugin{}
+	for _,e:=range entries{
+		if e.IsDir()||!strings.HasSuffix(strings.ToLower(e.Name()),".json"){continue}
+		b,err:=os.ReadFile(filepath.Join(pluginDir(),e.Name()));if err!=nil{continue}
+		var p Plugin;if json.Unmarshal(b,&p)==nil && strings.TrimSpace(p.ID)!=""{out=append(out,p)}
+	}
+	return out
+}
+
+func savePlugin(p Plugin) error {
+	p.ID=safePluginID(p.ID);if p.ID==""{return fmt.Errorf("plugin id is required")}
+	if p.Name==""{p.Name=p.ID};if p.CreatedAt==""{p.CreatedAt=time.Now().Format(time.RFC3339)}
+	if p.Headers==nil{p.Headers=map[string]string{}}
+	b,_:=json.MarshalIndent(p,"","  ");return os.WriteFile(pluginPath(p.ID),b,0600)
+}
+func deletePlugin(id string) error {return os.Remove(pluginPath(id))}
+func pluginByTool(name string)(Plugin,PluginTool,bool){
+	for _,p:=range loadPlugins(){if !p.Enabled{continue};for _,t:=range p.Tools{if pluginToolName(p,t.Name)==name{return p,t,true}}}
+	return Plugin{},PluginTool{},false
+}
+func pluginToolName(p Plugin,t string)string{return "plugin__"+safePluginID(p.ID)+"__"+safePluginID(t)}
+
+func pluginToolDefinitions() []map[string]any {
+	out:=[]map[string]any{}
+	for _,p:=range loadPlugins(){if !p.Enabled{continue};for _,t:=range p.Tools{
+		schema:=t.Parameters;if schema==nil{schema=map[string]any{"type":"object","properties":map[string]any{}}}
+		desc:=strings.TrimSpace(t.Description);if desc==""{desc="Plugin action provided by "+p.Name}
+		out=append(out,map[string]any{"type":"function","function":map[string]any{"name":pluginToolName(p,t.Name),"description":desc,"parameters":schema}})
+	}}
+	return out
+}
+
+type pluginRPC struct { JSONRPC string `json:"jsonrpc"`; ID any `json:"id,omitempty"`; Result json.RawMessage `json:"result,omitempty"`; Error any `json:"error,omitempty"` }
+var pluginRPCID uint64
+
+func pluginMCPRequest(p Plugin, method string, params any, session string)(pluginRPC,string,error){
+	pluginMu.Lock();pluginRPCID++;id:=pluginRPCID;pluginMu.Unlock()
+	payload:=map[string]any{"jsonrpc":"2.0","id":id,"method":method};if params!=nil{payload["params"]=params};b,_:=json.Marshal(payload)
+	req,err:=http.NewRequest("POST",p.URL,bytes.NewReader(b));if err!=nil{return pluginRPC{},session,err}
+	req.Header.Set("Content-Type","application/json");req.Header.Set("Accept","application/json, text/event-stream");req.Header.Set("User-Agent","AgentDesk/"+appVersion);req.Header.Set("MCP-Protocol-Version","2025-03-26")
+	if p.APIKey!=""{req.Header.Set("Authorization","Bearer "+p.APIKey)};for k,v:=range p.Headers{req.Header.Set(k,v)}
+	resp,err:=(&http.Client{Timeout:60*time.Second}).Do(req);if err!=nil{return pluginRPC{},session,err};defer resp.Body.Close()
+	next:=strings.TrimSpace(resp.Header.Get("Mcp-Session-Id"));if next!=""{session=next}
+	body,err:=io.ReadAll(io.LimitReader(resp.Body,32<<20));if err!=nil{return pluginRPC{},session,err}
+	ct:=strings.ToLower(resp.Header.Get("Content-Type"));if strings.Contains(ct,"text/event-stream")||bytes.Contains(body,[]byte("data:")){
+		sc:=bufio.NewScanner(bytes.NewReader(body));sc.Buffer(make([]byte,4096),8<<20);var last []byte
+		for sc.Scan(){line:=strings.TrimSpace(sc.Text());if strings.HasPrefix(line,"data:"){d:=strings.TrimSpace(strings.TrimPrefix(line,"data:"));if d!=""&&d!="[DONE]"&&json.Valid([]byte(d)){last=[]byte(d)}}}
+		if len(last)>0{body=last}
+	}
+	if resp.StatusCode>=400{return pluginRPC{},session,fmt.Errorf("plugin MCP HTTP %d: %s",resp.StatusCode,strings.TrimSpace(string(body)))}
+	var env pluginRPC;if err:=json.Unmarshal(body,&env);err!=nil{return pluginRPC{},session,fmt.Errorf("plugin MCP invalid JSON: %w",err)}
+	if env.Error!=nil{b,_:=json.Marshal(env.Error);return env,session,fmt.Errorf("plugin MCP error: %s",b)}
+	return env,session,nil
+}
+
+func discoverMCPPlugin(p Plugin)([]PluginTool,error){
+	env,session,err:=pluginMCPRequest(p,"initialize",map[string]any{"protocolVersion":"2025-03-26","capabilities":map[string]any{},"clientInfo":map[string]any{"name":"AgentDesk","version":appVersion}},"")
+	if err!=nil{return nil,err};_ = env
+	// Best-effort notification.
+	if session!=""{_,_,_ = pluginMCPRequest(p,"notifications/initialized",map[string]any{} ,session)}
+	env,_,err=pluginMCPRequest(p,"tools/list",map[string]any{},session);if err!=nil{return nil,err}
+	var result struct{Tools []struct{Name string `json:"name"`;Description string `json:"description"`;InputSchema map[string]any `json:"inputSchema"`} `json:"tools"`}
+	if err:=json.Unmarshal(env.Result,&result);err!=nil{return nil,err}
+	out:=make([]PluginTool,0,len(result.Tools));for _,t:=range result.Tools{out=append(out,PluginTool{Name:t.Name,Description:t.Description,Kind:"mcp",Parameters:t.InputSchema})}
+	return out,nil
+}
+
+func pluginMCPCall(p Plugin,t PluginTool,args map[string]any)(any,error){
+	env,session,err:=pluginMCPRequest(p,"initialize",map[string]any{"protocolVersion":"2025-03-26","capabilities":map[string]any{},"clientInfo":map[string]any{"name":"AgentDesk","version":appVersion}},"");if err!=nil{return nil,err}
+	if session!=""{_,_,_ = pluginMCPRequest(p,"notifications/initialized",map[string]any{},session)}
+	env,_,err=pluginMCPRequest(p,"tools/call",map[string]any{"name":t.Name,"arguments":args},session);if err!=nil{return nil,err}
+	var result map[string]any;if err:=json.Unmarshal(env.Result,&result);err!=nil{return nil,err};return result,nil
+}
+
+func templateValues(s string,args map[string]any)string{
+	for k,v:=range args{b,_:=json.Marshal(v);raw:=string(b);if str,ok:=v.(string);ok{raw=str};s=strings.ReplaceAll(s,"{{"+k+"}}",raw)}
+	return s
+}
+func pluginHTTPCall(p Plugin,t PluginTool,args map[string]any)(any,error){
+	method:=strings.ToUpper(strings.TrimSpace(t.Method));if method==""{method="GET"};target:=templateValues(t.URL,args);u,err:=url.Parse(target);if err!=nil||u.Scheme!="https"&&u.Scheme!="http"{return nil,fmt.Errorf("plugin URL must be HTTP or HTTPS")}
+	body:=templateValues(t.BodyTemplate,args);var rdr io.Reader;if body!=""{rdr=strings.NewReader(body)}
+	req,err:=http.NewRequest(method,target,rdr);if err!=nil{return nil,err};req.Header.Set("User-Agent","AgentDesk/"+appVersion);if body!=""{req.Header.Set("Content-Type","application/json")}
+	for k,v:=range p.Headers{req.Header.Set(k,v)};for k,v:=range t.Headers{req.Header.Set(k,templateValues(v,args))};if p.APIKey!=""&&req.Header.Get("Authorization")==""{req.Header.Set("Authorization","Bearer "+p.APIKey)}
+	resp,err:=(&http.Client{Timeout:60*time.Second}).Do(req);if err!=nil{return nil,err};defer resp.Body.Close();raw,err:=io.ReadAll(io.LimitReader(resp.Body,16<<20));if err!=nil{return nil,err};if resp.StatusCode>=400{return nil,fmt.Errorf("plugin HTTP %d: %s",resp.StatusCode,strings.TrimSpace(string(raw)))}
+	var v any;if json.Unmarshal(raw,&v)==nil{return v,nil};return map[string]any{"status":resp.StatusCode,"text":string(raw)},nil
+}
+
+func executePluginTool(name,args string)(any,string,error){
+	p,t,ok:=pluginByTool(name);if !ok{return nil,"",fmt.Errorf("plugin tool not found or disabled")}
+	var a map[string]any;if strings.TrimSpace(args)!=""{if err:=json.Unmarshal([]byte(args),&a);err!=nil{return nil,"",fmt.Errorf("invalid plugin arguments: %w",err)}}
+	var result any;var err error
+	if strings.EqualFold(t.Kind,"mcp")||strings.EqualFold(p.Kind,"mcp"){result,err=pluginMCPCall(p,t,a)}else{result,err=pluginHTTPCall(p,t,a)}
+	if err!=nil{return nil,"",err};return result,"Plugin: "+p.Name+" → "+t.Name,nil
+}
+
+func pluginListHandler(w http.ResponseWriter,r *http.Request){jsonResp(w,map[string]any{"plugins":loadPlugins()})}
+func pluginSaveHandler(w http.ResponseWriter,r *http.Request){
+	if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var p Plugin;if readJSON(r,&p)!=nil{http.Error(w,"invalid plugin",400);return}
+	p.ID=safePluginID(p.ID);if p.ID==""{p.ID=safePluginID(p.Name)};if err:=savePlugin(p);err!=nil{http.Error(w,err.Error(),400);return};jsonResp(w,map[string]any{"ok":true,"plugin":p})
+}
+func pluginDeleteHandler(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var req struct{ID string `json:"id"`};if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return};if err:=deletePlugin(req.ID);err!=nil{http.Error(w,err.Error(),404);return};jsonResp(w,map[string]any{"ok":true})}
+func pluginDiscoverHandler(w http.ResponseWriter,r *http.Request){
+	if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var p Plugin;if readJSON(r,&p)!=nil{http.Error(w,"invalid plugin",400);return};if strings.TrimSpace(p.URL)==""{http.Error(w,"MCP URL is required",400);return};p.Kind="mcp";tools,err:=discoverMCPPlugin(p);if err!=nil{http.Error(w,err.Error(),502);return};jsonResp(w,map[string]any{"ok":true,"tools":tools})
+}
+func pluginTestHandler(w http.ResponseWriter,r *http.Request){
+	if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var p Plugin;if readJSON(r,&p)!=nil{http.Error(w,"invalid plugin",400);return};if p.Kind=="mcp"{_,err:=discoverMCPPlugin(p);if err!=nil{http.Error(w,err.Error(),502);return}};jsonResp(w,map[string]any{"ok":true})
+}
