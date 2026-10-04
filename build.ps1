@@ -9,7 +9,6 @@ $files = @{
   "main.go.txt" = "main.go"
   "agent_tools.go.txt" = "agent_tools.go"
   "local_engine.go.txt" = "local_engine.go"
-  "plugin_engine.go.txt" = "plugin_engine.go"
   "parallel_mcp.go.txt" = "parallel_mcp.go"
   "process_other.go.txt" = "process_other.go"
   "process_windows.go.txt" = "process_windows.go"
