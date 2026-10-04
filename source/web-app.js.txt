@@ -2,6 +2,9 @@ const $ = s => document.querySelector(s);
 let config={providers:[]},memories=[],conversations=[];
 const state={messages:[],chatId:null,attachments:[],selectedProviderId:'',selectedModel:'',modelsByProvider:{}};
 let editingProviderId='';
+let pinnedChats=new Set();
+try{pinnedChats=new Set(JSON.parse(localStorage.getItem('agentdesk:pinnedChats')||'[]'))}catch{pinnedChats=new Set()}
+function savePinnedChats(){localStorage.setItem('agentdesk:pinnedChats',JSON.stringify([...pinnedChats]))}
 let terminalApprovalAlways=false;
 const codePackages=new Map();let packageSeq=0;const modelRefreshInFlight=new Set();
 function isGroqProviderClient(p=current()){try{return !!p&&/api\.groq\.com$/i.test(new URL(normalizeBaseURL(p.baseUrl)).hostname)}catch{return false}}
@@ -11,32 +14,26 @@ function speechPlainText(text){return String(text||'').replace(/```[\\s\\S]*?```
 function splitSpeechText(text,max=190){const clean=speechPlainText(text),out=[];let rest=clean;while(rest.length>max){let cut=Math.max(rest.lastIndexOf('. ',max),rest.lastIndexOf('? ',max),rest.lastIndexOf('! ',max),rest.lastIndexOf(', ',max),rest.lastIndexOf(' ',max));if(cut<40)cut=max;out.push(rest.slice(0,cut).trim());rest=rest.slice(cut).trim()}if(rest)out.push(rest);return out}
 async function speakText(text,button){if(!isGroqProviderClient()){alert('Text-to-speech is currently available for Groq providers.');return}if(activeSpeechAudio){speechStopRequested=true;activeSpeechAudio.pause();activeSpeechAudio=null;if(button)button.textContent='▶ Speak';return}const chunks=splitSpeechText(text);if(!chunks.length)return;speechStopRequested=false;const original=button?.textContent;if(button)button.textContent='■ Stop';try{for(const chunk of chunks){if(speechStopRequested)break;const r=await fetch('/api/groq/speech',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:current()?.id,model:$('#ttsModel')?.value||'canopylabs/orpheus-v1-english',voice:$('#groqVoice')?.value||'hannah',input:chunk,responseFormat:'wav'})});if(!r.ok)throw new Error(await r.text());const blob=await r.blob(),url=URL.createObjectURL(blob),audio=new Audio(url);activeSpeechAudio=audio;await new Promise((resolve,reject)=>{audio.onended=resolve;audio.onerror=reject;audio.play().catch(reject)});URL.revokeObjectURL(url);activeSpeechAudio=null}}catch(e){if(!speechStopRequested)alert('Speech generation failed: '+e.message)}finally{activeSpeechAudio=null;speechStopRequested=false;if(button)button.textContent=original||'▶ Speak'}}
 function attachSpeechButton(root,text){if(!root)return;root.querySelector('.speakBtn')?.remove();if(!String(text||'').trim()||!isGroqProviderClient())return;const b=document.createElement('button');b.className='speakBtn';b.type='button';b.textContent='▶ Speak';b.title='Read this response aloud with Groq TTS';b.onclick=()=>speakText(text,b);root.appendChild(b)}
+function speechProvider(){return editableProviders().find(x=>x.hasApiKey&&isGroqProviderClient(x))||null}
 async function loadSpeechModels(providerId){
-  const select=$('#sttModel'); if(!select||!providerId)return;
-  const previous=select.value;
-  select.innerHTML='<option value="">Loading voice to text models…</option>';
-  try{
-    const r=await api('/api/audio/models?provider='+encodeURIComponent(providerId));
-    const models=Array.isArray(r.models)?r.models:[];
-    select.innerHTML=models.map(m=>'<option value="'+esc(m.id)+'">'+esc(m.name||m.id)+'</option>').join('')||'<option value="">No voice-to-text models discovered</option>';
+  const select=$('#sttModel');if(!select||!providerId)return;const previous=select.value;
+  select.innerHTML='<option value="">Loading Groq voice to text models…</option>';
+  try{const r=await api('/api/audio/models?provider='+encodeURIComponent(providerId));let models=Array.isArray(r.models)?r.models:[];
+    if(!models.length)models=[{id:'whisper-large-v3-turbo',name:'Whisper Large V3 Turbo'},{id:'whisper-large-v3',name:'Whisper Large V3'}];
+    select.innerHTML=models.map(m=>'<option value="'+esc(m.id)+'">Groq · '+esc(m.name||m.id)+'</option>').join('');
     if(previous&&models.some(m=>m.id===previous))select.value=previous;
-  }catch(e){
-    select.innerHTML='<option value="">Voice-to-text unavailable</option>';
-  }
+  }catch(e){select.innerHTML='<option value="">Groq voice-to-text unavailable</option>'}
 }
 function updateSpeechControls(p=current()){
-  const stt=$('#sttModel'),record=$('#recordAudio'),tts=$('#ttsModel'),voice=$('#groqVoice');
-  const hasKey=!!p&&!!p.hasApiKey&&!String(p.baseUrl||'').startsWith('local://');
-  if(stt)stt.classList.toggle('hidden',!hasKey);
-  if(record)record.classList.toggle('hidden',!hasKey);
-  const groq=hasKey&&isGroqProviderClient(p);
-  if(tts)tts.classList.toggle('hidden',!groq);
-  if(voice)voice.classList.toggle('hidden',!groq);
-  if(hasKey&&stt&&(!stt.dataset.provider||stt.dataset.provider!==p.id)){stt.dataset.provider=p.id;loadSpeechModels(p.id)}
+  const stt=$('#sttModel'),record=$('#recordAudio'),tts=$('#ttsModel'),voice=$('#groqVoice'),sp=speechProvider();
+  if(stt)stt.classList.toggle('hidden',!sp);if(record)record.classList.toggle('hidden',!sp);
+  const groq=!!p&&!!p.hasApiKey&&isGroqProviderClient(p);if(tts)tts.classList.toggle('hidden',!groq);if(voice)voice.classList.toggle('hidden',!groq);
+  if(sp&&stt&&(!stt.dataset.provider||stt.dataset.provider!==sp.id)){stt.dataset.provider=sp.id;loadSpeechModels(sp.id)}
 }
 async function toggleVoiceRecording(){
-  const p=current();
+  const p=current(),sp=speechProvider();
   if(!p||!p.hasApiKey){alert('Attach a provider API key to use Voice to Text.');return}
+  if(!sp){alert('Add a Groq provider with an API key to use Voice to Text.');return}
   const btn=$('#recordAudio');
   if(mediaRecorder&&mediaRecorder.state==='recording'){mediaRecorder.stop();return}
   if(!navigator.mediaDevices?.getUserMedia){alert('This desktop window does not expose microphone capture.');return}
@@ -48,7 +45,7 @@ async function toggleVoiceRecording(){
     mediaRecorder.onstop=async()=>{
       stream.getTracks().forEach(t=>t.stop());
       const blob=new Blob(mediaChunks,{type:mime});const fd=new FormData();
-      fd.append('file',blob,'AgentDesk-voice.webm');fd.append('provider',p.id);fd.append('model',$('#sttModel')?.value||'');
+      fd.append('file',blob,'AgentDesk-voice.webm');fd.append('provider',sp.id);fd.append('model',$('#sttModel')?.value||'whisper-large-v3-turbo');
       btn.disabled=true;btn.textContent='… Transcribing';
       try{
         const r=await api('/api/audio/transcribe',{method:'POST',body:fd});
@@ -130,10 +127,21 @@ function renderUserAttachments(list=[]){return (list||[]).map(a=>{const kind=a.k
 function formatBytes(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB'}
 function addMsg(role,text,cls='',attachments=[]){const m=$('#messages');$('.welcome')?.remove();const d=document.createElement('div');d.className='msg '+cls+(role==='You'?' userMessage':'');const attachHtml=role==='You'&&attachments.length?'<div class="sentAttachments">'+renderUserAttachments(attachments)+'</div>':'';d.innerHTML=`<div class="role ${role==='You'?'userRole':''}"><span class="roleBadge">${role==='You'?'●':'✦'}</span>${esc(role)}</div>${attachHtml}<div class="bubble">${role==='AgentDesk'?md(text):esc(text).replace(/\n/g,'<br>')}</div>`;m.appendChild(d);m.scrollTop=m.scrollHeight;if(role==='AgentDesk'){bindCodeActions(d);attachPackageButton(d,typeof text==='string'?text:'');attachSpeechButton(d,typeof text==='string'?text:'')}return d.querySelector('.bubble')}
 function beginActivity(){const e=$('#toolActivity');e.classList.remove('hidden');e.innerHTML='<div class="thinkingActivity"><span class="thinkingDot"></span><span class="thinkingDot"></span><span class="thinkingDot"></span><span>Working…</span></div>';return e}
-function addTool(text){const e=$('#toolActivity');if(e.classList.contains('hidden'))beginActivity();const d=document.createElement('div');d.className='activityItem';d.textContent='• '+text;e.appendChild(d);$('#messages').scrollTop=$('#messages').scrollHeight}
+function addTool(text,attachmentId=''){const e=$('#toolActivity');if(e.classList.contains('hidden'))beginActivity();const d=document.createElement('div');d.className='activityItem';if(attachmentId)d.dataset.attachmentId=attachmentId;d.textContent='• '+text;e.appendChild(d);$('#messages').scrollTop=$('#messages').scrollHeight}
+function removeAttachmentActivity(id){if(!id)return;document.querySelectorAll('.activityItem[data-attachment-id="'+CSS.escape(String(id))+'"]').forEach(x=>x.remove());if(!$('#toolActivity').querySelector('.activityItem'))hideActivity()}
 function hideActivity(){const e=$('#toolActivity');if(e){e.classList.add('hidden');e.innerHTML=''}}
 function clearChatSources(){const r=$('#chatSources');r.classList.add('hidden');$('#chatSourceCount').textContent='0';$('#chatSourceList').innerHTML=''}
 function addChatSources(list){const usable=(list||[]).filter(s=>String(s?.url||'').trim());if(!usable.length)return;const r=$('#chatSources');const wasHidden=r.classList.contains('hidden');if(wasHidden){r.classList.remove('hidden')}const existing=new Set([...r.querySelectorAll('[data-source-url]')].map(x=>x.dataset.sourceUrl));for(const s of usable){const u=String(s.url).trim();if(existing.has(u))continue;existing.add(u);const d=document.createElement('div');d.className='railSource';d.dataset.sourceUrl=u;d.innerHTML=`<a href="${esc(u)}" target="_blank" rel="noreferrer">${esc(s.title||u)}</a><div class="railUrl">${esc(u)}</div>`;$('#chatSourceList').appendChild(d)}$('#chatSourceCount').textContent=String(existing.size)}
+async function requestCodeApproval(ev){
+  const modal=$('#codeApprovalModal');if(!modal){await api('/api/code-approval',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ev.id,decision:'no'})}).catch(()=>{});return}
+  $('#codeApprovalLanguage').textContent=ev.language||'code';
+  $('#codeApprovalCode').textContent=ev.code||'';
+  modal.classList.remove('hidden');
+  return new Promise(resolve=>{
+    const finish=async decision=>{modal.classList.add('hidden');modal.querySelectorAll('[data-code-approval]').forEach(b=>b.onclick=null);try{await api('/api/code-approval',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ev.id,decision})})}catch{}resolve()};
+    modal.querySelectorAll('[data-code-approval]').forEach(b=>b.onclick=()=>finish(b.dataset.codeApproval));
+  });
+}
 async function requestTerminalApproval(ev){
   const modal=$('#terminalApprovalModal');
   const cmd=$('#terminalApprovalCommand');
@@ -153,7 +161,7 @@ async function requestTerminalApproval(ev){
 }
 function autoGrowPrompt(){const p=$('#prompt');if(!p)return;p.style.height='auto';const h=Math.min(Math.max(p.scrollHeight,54),220);p.style.height=h+'px';p.style.overflowY=p.scrollHeight>220?'auto':'hidden'}
 function resetChat(){state.messages=[];state.chatId=null;state.attachments=[];renderAttachments();clearChatSources();hideActivity();$('#messages').innerHTML='<div class="welcome"><div class="orb">✦</div><h1>What are we building?</h1><p>Ask questions, write code, search the web, or use your saved memory.</p><div class="chips"><button data-fill="Research something on the web">Research something on the web</button><button data-fill="Write a Python script">Write a Python script</button><button data-fill="Explain an API with an example">Explain an API</button></div></div>';bindChips();renderChats();$('#prompt').value='';autoGrowPrompt()}
-function renderAttachments(){const el=$('#attachmentTray');el.innerHTML=state.attachments.map((a,i)=>{const v=a.kind==='image'&&a.dataURL?`<img class="attachmentThumb" src="${a.dataURL}" alt="image preview">`:'';return`<div class="attachment">${v}<div><span>${a.kind==='image'?'🖼️':'📎'} ${esc(a.name)}</span>${a.kind==='image'?'<div class="attachMeta">image bytes ready for vision input</div>':''}</div><button data-del="${i}" type="button">×</button></div>`}).join('');el.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{state.attachments.splice(Number(b.dataset.del),1);renderAttachments()})}
+function renderAttachments(){const el=$('#attachmentTray');el.innerHTML=state.attachments.map((a,i)=>{const v=a.kind==='image'&&a.dataURL?'<img class="attachmentThumb" src="'+a.dataURL+'" alt="image preview">':'';return '<div class="attachment">'+v+'<div><span>'+(a.kind==='image'?'🖼️':'📎')+' '+esc(a.name)+'</span>'+(a.kind==='image'?'<div class="attachMeta">image bytes ready for vision input</div>':'')+'</div><button data-del="'+i+'" type="button">×</button></div>'}).join('');el.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.del),a=state.attachments[i];if(a)removeAttachmentActivity(a.id||a.uploadId);state.attachments.splice(i,1);renderAttachments()})}
 async function ensureChat(title){if(state.chatId)return;state.chatId=String(Date.now());const c={id:state.chatId,title:(title||'New Chat').slice(0,55),folder:'General',updated:new Date().toISOString(),messages:[]};conversations.unshift(c);await saveConversation(c);renderChats()}
 async function saveConversation(c){await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)})}
 async function getBrowserLocation(){if(!navigator.geolocation)return null;return await new Promise(resolve=>navigator.geolocation.getCurrentPosition(pos=>resolve({latitude:pos.coords.latitude,longitude:pos.coords.longitude}),()=>resolve(null),{enableHighAccuracy:false,timeout:5000,maximumAge:10*60*1000}))}
@@ -223,6 +231,7 @@ async function send(){
         else if(ev.type==='model_pull_failed'){showLocalBanner(ev.message||'Model Pull failed, Please attach a key')}
         else if(ev.type==='vision_encoder_offer'){ await requestVisionEncoderOffer(ev); }
         else if(ev.type==='terminal_approval'){ await requestTerminalApproval(ev); }
+        else if(ev.type==='code_approval'){ await requestCodeApproval(ev); }
         else if(ev.type==='chunk'){
           hideThinking(thinking);
           out+=ev.text;
@@ -281,7 +290,7 @@ async function loadChat(id){
     renderChats();
   }catch(e){addMsg('AgentDesk','Could not load that chat: '+e.message)}
 }
-function renderChats(){const el=$('#chatList');el.innerHTML=conversations.slice(0,80).map(c=>`<div class="chatItem ${c.id===state.chatId?'active':''}"><button class="chatOpen" data-open="${esc(c.id)}" type="button">${esc(c.title||'New Chat')}</button><span class="chatActions"><button data-rename="${esc(c.id)}" title="Rename" type="button">✎</button><button data-delete="${esc(c.id)}" title="Delete" type="button">×</button></span></div>`).join('');el.querySelectorAll('[data-open]').forEach(b=>b.onclick=e=>{e.stopPropagation();loadChat(b.dataset.open)});el.querySelectorAll('[data-rename]').forEach(b=>b.onclick=async e=>{e.stopPropagation();const c=conversations.find(x=>x.id===b.dataset.rename);if(!c)return;const t=prompt('Rename chat:',c.title||'New Chat');if(t===null)return;const title=t.trim();if(!title)return;c.title=title;c.updated=new Date().toISOString();try{await saveConversation(c);renderChats()}catch(err){alert('Rename failed: '+err.message)}});el.querySelectorAll('[data-delete]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!confirm('Delete this chat?'))return;try{await api('/api/conversations?id='+encodeURIComponent(b.dataset.delete),{method:'DELETE'});conversations=conversations.filter(c=>c.id!==b.dataset.delete);if(state.chatId===b.dataset.delete)resetChat();renderChats()}catch(err){alert('Delete failed: '+err.message)}})}
+function renderChats(){const el=$('#chatList');const ordered=[...conversations].sort((a,b)=>{const ap=pinnedChats.has(a.id)?1:0,bp=pinnedChats.has(b.id)?1:0;return bp-ap||new Date(b.updated)-new Date(a.updated)});el.innerHTML=ordered.slice(0,80).map(c=>`<div class="chatItem ${c.id===state.chatId?'active':''}"><button class="chatOpen" data-open="${esc(c.id)}" type="button">${esc(c.title||'New Chat')}</button><span class="chatActions"><button data-pin="${esc(c.id)}" title="${pinnedChats.has(c.id)?'Unpin':'Pin'} chat" type="button">${pinnedChats.has(c.id)?'★':'☆'}</button><button data-rename="${esc(c.id)}" title="Rename" type="button">✎</button><button data-delete="${esc(c.id)}" title="Delete" type="button">×</button></span></div>`).join('');el.querySelectorAll('[data-open]').forEach(b=>b.onclick=e=>{e.stopPropagation();loadChat(b.dataset.open)});el.querySelectorAll('[data-pin]').forEach(b=>b.onclick=e=>{e.stopPropagation();const id=b.dataset.pin;if(pinnedChats.has(id))pinnedChats.delete(id);else pinnedChats.add(id);savePinnedChats();renderChats()});el.querySelectorAll('[data-rename]').forEach(b=>b.onclick=async e=>{e.stopPropagation();const c=conversations.find(x=>x.id===b.dataset.rename);if(!c)return;const t=prompt('Rename chat:',c.title||'New Chat');if(t===null)return;const title=t.trim();if(!title)return;c.title=title;c.updated=new Date().toISOString();try{await saveConversation(c);renderChats()}catch(err){alert('Rename failed: '+err.message)}});el.querySelectorAll('[data-delete]').forEach(b=>b.onclick=async e=>{e.stopPropagation();if(!confirm('Delete this chat?'))return;try{await api('/api/conversations?id='+encodeURIComponent(b.dataset.delete),{method:'DELETE'});conversations=conversations.filter(c=>c.id!==b.dataset.delete);if(state.chatId===b.dataset.delete)resetChat();renderChats()}catch(err){alert('Delete failed: '+err.message)}})}
 async function search(){const q=$('#searchInput').value.trim();if(!q)return;$('#searchResults').innerHTML='<p class="muted">Searching and reading top results…</p>';try{const r=await api('/api/search?q='+encodeURIComponent(q));$('#searchResults').innerHTML=(r.results||[]).map((x,i)=>`<div class="result"><div class="resultHead"><a href="${esc(x.url)}" target="_blank" rel="noreferrer">${esc(x.title||x.url)}</a>${x.content?`<button class="readBtn" data-read-index="${i}">Read page</button>`:''}</div><p class="url">${esc(x.url)}</p><div class="snippet">${esc(x.snippet||'')}</div>${x.content?`<details class="pageRead"><summary>Page content retrieved by AgentDesk</summary><div class="pageText">${esc(x.content)}</div>${Array.isArray(x.links)&&x.links.length?`<div class="pageLinks"><b>Links found on page:</b> ${x.links.slice(0,12).map(l=>`<a href="${esc(l.url)}" target="_blank" rel="noreferrer">${esc(l.text||l.url)}</a>`).join(' · ')}</div>`:''}</details>`:''}</div>`).join('')||'<p class="muted">No results found.</p>'}catch(e){$('#searchResults').textContent='Search error: '+e.message}}
 async function deepResearch(){const q=$('#researchInput').value.trim();if(!q)return;const p=current();if(!p){$('#researchStatus').textContent='Add a provider first.';return}$('#researchStatus').textContent='Starting…';$('#researchOutput').innerHTML='';$('#researchSources').innerHTML='';$('#sourceCount').textContent='0';try{const geo=await getBrowserLocation();const r=await startResearchJob(q,p,geo);formatResearchOutput(r.content||'');renderResearchSources(r.sources||[]);$('#researchStatus').textContent='Research complete.'}catch(e){$('#researchStatus').textContent='Error: '+e.message}}
 function formatResearchOutput(s){const el=$('#researchOutput');el.innerHTML=md(s);bindCodeActions(el);attachPackageButton(el,s)}
@@ -298,8 +307,8 @@ async function uploadFiles(files){
         path:r.path||'',size:Number(r.size)||file.size||0,extension:r.extension||''
       });
       renderAttachments();
-      addTool('Attached: '+(r.name||file.name)+' · '+formatBytes(r.size||file.size||0)+(r.text?' · contents extracted':' · metadata only'));
-      if(r.kind==='image')addTool('Image attached. Vision support will be checked when the message is sent.');
+      addTool('Attached: '+(r.name||file.name)+' · '+formatBytes(r.size||file.size||0)+(r.text?' · contents extracted':' · metadata only'),r.id||'');
+      if(r.kind==='image')addTool('Image attached. Vision support will be checked when the message is sent.',r.id||'');
     }catch(e){addTool('File error: '+e.message)}
   }
 }
@@ -353,12 +362,10 @@ function showLocalBanner(text){
 }
 function hideLocalBanner(){const b=$('#modelPullBanner');if(b)b.classList.add('hidden')}
 function renderLocalHardware(h){
-  $('#localHardwareSummary').innerHTML='<div><b>'+esc(h.gpuName||'No NVIDIA GPU detected')+'</b><span>'+esc(h.vramGB?Number(h.vramGB).toFixed(1)+' GB VRAM':'GPU scan unavailable')+'</span></div><div><b>'+esc(h.cpuTier||'CPU tier pending')+'</b><span>'+esc((h.cpuCores||0)+' cores · '+(h.cpuThreads||0)+' threads')+'</span></div><div><b>'+esc(h.ramGB?Number(h.ramGB).toFixed(1)+' GB RAM':'RAM unavailable')+'</b><span>'+esc(h.ramSpeedMHz?(h.ramSpeedMHz+' MHz'):'Speed unavailable')+'</span></div>';
+  const summary=$('#localHardwareSummary');if(!summary)return;
+  summary.innerHTML='<div><b>'+esc(h.gpuName||'No NVIDIA GPU detected')+'</b><span>'+esc(h.vramGB?Number(h.vramGB).toFixed(1)+' GB VRAM':'GPU scan unavailable')+'</span></div><div><b>'+esc(h.cpuTier||'CPU tier pending')+'</b><span>'+esc((h.cpuCores||0)+' cores · '+(h.cpuThreads||0)+' threads')+'</span></div><div><b>'+esc(h.ramGB?Number(h.ramGB).toFixed(1)+' GB RAM':'RAM unavailable')+'</b><span>'+esc(h.ramSpeedMHz?(h.ramSpeedMHz+' MHz'):'Speed unavailable')+'</span></div>';
 }
-async function localScanHardware(){
-  const r=await api('/api/local/hardware',{method:'POST'});
-  localSetupData=r;renderLocalHardware(r);return r;
-}
+async function localScanHardware(){const body=$('#localSetupBody');if(body)body.innerHTML='<div class="hardwareScan"><div class="scanSpinner"></div><h2>Checking your hardware…</h2><p>Scanning GPU, CPU, RAM and memory speed. AgentDesk is still working.</p><div class="scanSteps"><span>GPU</span><span>CPU</span><span>RAM</span><span>Memory speed</span></div></div>';const r=await api('/api/local/hardware',{method:'POST'});localSetupData=r;renderLocalHardware(r);return r;}
 async function saveLocalSetup(){
   const privacy=$('#localPrivacy')?.value||'Both';
   const hasGPU=!!(localSetupData?.nvidia||localSetupData?.hardware?.nvidia);
@@ -408,7 +415,7 @@ async function maybeShowLocalOnboarding(){
     $('#localSetupStep').textContent='1 / 4';
     $('#localSetupBody').innerHTML='<h2>Let’s make your <span>experience</span> BETTER</h2><p>AgentDesk will use this to choose local models that fit your computer.</p><div class="setupQuestion">Do you have a dedicated GPU (NVIDIA)?</div><div class="actions"><button id="localGpuYes">Yes</button><button class="secondary" id="localGpuNo">No</button></div>';
     $('#localGpuYes').onclick=async()=>{try{const r=await localScanHardware();if(!r.nvidia){$('#localSetupBody').innerHTML='<h2>GPU scan</h2><p>Scan failed.</p><p>Please enter the amount of VRAM you have</p><input id="localVram" type="number" min="0" step="0.1" placeholder="VRAM in GB"><div class="actions"><button id="localVramNext">Continue</button></div><div id="localHardwareSummary" class="localHardwareSummary"></div>';$('#localVramNext').onclick=()=>localPrivacyStep(r)}else localPrivacyStep(r)}catch(e){$('#localSetupBody').innerHTML='<h2>GPU scan</h2><p>Scan failed.</p><p>Please enter the amount of VRAM you have</p><input id="localVram" type="number" min="0" step="0.1" placeholder="VRAM in GB"><div class="actions"><button id="localVramNext">Continue</button></div>';$('#localVramNext').onclick=()=>localPrivacyStep({})}};
-    $('#localGpuNo').onclick=async()=>{const r=await localScanHardware();localPrivacyStep(r)};
+    $('#localGpuNo').onclick=async()=>{try{const r=await localScanHardware();localPrivacyStep(r)}catch(e){localPrivacyStep({})}};
   }catch{}
 }
 function localPrivacyStep(h){
@@ -420,4 +427,20 @@ function localPrivacyStep(h){
 }
 function openLocalView(){show('local');refreshLocalProviders()}
 async function load(){config=await api('/api/config');config.providers=config.providers||[];memories=await api('/api/memory');conversations=await api('/api/conversations');const ps=validProviders();const first=ps[0];renderProviderSelects(first?.id||'');renderMem();renderChats();bindChips();setupPaste();if(first)setTimeout(()=>refreshProviderModels(first.id,true),100);await maybeShowLocalOnboarding()}
-document.addEventListener('DOMContentLoaded',()=>{try{$('#send').onclick=send;$('#recordAudio').onclick=toggleVoiceRecording;$('#ttsModel').onchange=updateTTSVoices;updateSpeechControls(current());$('#prompt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});$('#provider').onchange=()=>setProvider($('#provider').value,{refresh:true});$('#modelSelect').onchange=()=>{state.selectedModel=$('#modelSelect').value;updateTopMeta(current())};$('#settingsProviderSelect').onchange=()=>setProvider($('#settingsProviderSelect').value,{refresh:true});$('#newChat').onclick=resetChat;$('#closeChatSources').onclick=clearChatSources;document.addEventListener('click',e=>{const n=e.target.closest('.nav');if(n){e.preventDefault();show(n.dataset.view)}});$('#doSearch').onclick=search;$('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();search()}});$('#doResearch').onclick=deepResearch;$('#researchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();deepResearch()}});$('#addMem').onclick=async()=>{const t=$('#memInput').value.trim();if(!t)return;try{await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,kind:$('#memKind').value})});$('#memInput').value='';memories=await api('/api/memory');renderMem()}catch(e){$('#memoryImportStatus').textContent='Memory save failed: '+e.message}};$('#copyMemoryPrompt').onclick=async()=>{await navigator.clipboard.writeText(MEMORY_EXPORT_PROMPT);$('#memoryImportStatus').textContent='Memory export prompt copied.'};$('#importMemory').onclick=importMemory;$('#saveProvider').onclick=saveProvider;$('#newProvider').onclick=newProvider;$('#testProvider').onclick=testProvider;$('#discoverModels').onclick=discoverModels;$('#localDownloadButton').onclick=()=>installLocalModelUI($('#localModelUrl').value.trim());$('#attachHFKey').onclick=async()=>{const t=$('#hfToken').value.trim();if(!t)return;try{await api('/api/local/hf-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});hideLocalBanner();$('#localStatus').textContent='Hugging Face key attached locally.'}catch(e){showLocalBanner('Model Pull failed, Please attach a key')}};$('#addFile').onclick=()=>$('#fileInput').click();$('#fileInput').onchange=e=>uploadFiles(e.target.files);$('#closeRun').onclick=()=>$('#runModal').classList.add('hidden');$('#cancelRun').onclick=()=>$('#runModal').classList.add('hidden');$('#executeCode').onclick=executeCode;$('#runTerminal').onclick=runTerminal;$('#terminalUseHome').onclick=loadTerminalInfo;$('#terminalCommand').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();runTerminal()}});load().catch(e=>{const el=$('#testResult');if(el)el.textContent='Startup warning: '+e.message})}catch(e){console.error(e)}})
+document.addEventListener('DOMContentLoaded',()=>{try{$('#send').onclick=send;$('#recordAudio').onclick=toggleVoiceRecording;$('#ttsModel').onchange=updateTTSVoices;updateSpeechControls(current());$('#prompt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});$('#provider').onchange=()=>setProvider($('#provider').value,{refresh:true});$('#modelSelect').onchange=()=>{state.selectedModel=$('#modelSelect').value;updateTopMeta(current())};$('#settingsProviderSelect').onchange=()=>setProvider($('#settingsProviderSelect').value,{refresh:true});$('#newChat').onclick=resetChat;$('#closeChatSources').onclick=clearChatSources;document.addEventListener('click',e=>{const n=e.target.closest('.nav');if(n){e.preventDefault();show(n.dataset.view)}});$('#doSearch').onclick=search;$('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();search()}});$('#doResearch').onclick=deepResearch;$('#researchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();deepResearch()}});$('#addMem').onclick=async()=>{const t=$('#memInput').value.trim();if(!t)return;try{await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,kind:$('#memKind').value})});$('#memInput').value='';memories=await api('/api/memory');renderMem()}catch(e){$('#memoryImportStatus').textContent='Memory save failed: '+e.message}};$('#copyMemoryPrompt').onclick=async()=>{await navigator.clipboard.writeText(MEMORY_EXPORT_PROMPT);$('#memoryImportStatus').textContent='Memory export prompt copied.'};$('#importMemory').onclick=importMemory;$('#saveProvider').onclick=saveProvider;$('#newProvider').onclick=newProvider;$('#testProvider').onclick=testProvider;$('#discoverModels').onclick=discoverModels;$('#localDownloadButton').onclick=()=>installLocalModelUI($('#localModelUrl').value.trim());$('#attachHFKey').onclick=async()=>{const t=$('#hfToken').value.trim();if(!t)return;try{await api('/api/local/hf-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});hideLocalBanner();$('#localStatus').textContent='Hugging Face key attached locally.'}catch(e){showLocalBanner('Model Pull failed, Please attach a key')}};$('#addFile').onclick=()=>$('#fileInput').click();$('#fileInput').onchange=e=>uploadFiles(e.target.files);$('#closeRun').onclick=()=>$('#runModal').classList.add('hidden');$('#exportChat').onclick=exportCurrentChat;$('#openPalette').onclick=openPalette;$('#closePalette').onclick=closePalette;$('#paletteInput').addEventListener('input',renderPalette);$('#paletteInput').addEventListener('keydown',e=>{if(e.key==='Escape')closePalette();if(e.key==='Enter'){const first=$('#paletteList .paletteItem');if(first)first.click()}});document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()}else if(e.key==='Escape')closePalette()});$('#cancelRun').onclick=()=>$('#runModal').classList.add('hidden');$('#executeCode').onclick=executeCode;$('#runTerminal').onclick=runTerminal;$('#terminalUseHome').onclick=loadTerminalInfo;$('#terminalCommand').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();runTerminal()}});load().catch(e=>{const el=$('#testResult');if(el)el.textContent='Startup warning: '+e.message})}catch(e){console.error(e)}})
+function exportCurrentChat(){
+  if(!state.messages.length){alert('There is no chat content to export yet.');return}
+  const title=(conversations.find(x=>x.id===state.chatId)?.title||'AgentDesk Chat').trim(),lines=['# '+title,'','Exported from AgentDesk · '+new Date().toLocaleString(),''];
+  for(const m of state.messages){lines.push('## '+(m?.role==='user'?'You':'AgentDesk'),'');lines.push(displayMessageContent(m?.content)||'','')}
+  const blob=new Blob([lines.join('\n')],{type:'text/markdown;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=(title.replace(/[^a-z0-9-_]+/gi,'-').replace(/^-|-$/g,'')||'AgentDesk-Chat')+'.md';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),15000)
+}
+function paletteItems(q=''){
+  const query=String(q||'').toLowerCase().trim();
+  const items=[['New Chat','Start a clean conversation',()=>resetChat()],['Focus Composer','Jump to the message box',()=>$('#prompt').focus()],['Toggle Agent Tools','Turn Agent tools on or off',()=>$('#agentMode').click()],['Toggle Research','Turn Research mode on or off',()=>$('#researchMode').click()],['Voice to Text','Start recording with Groq Whisper',()=>toggleVoiceRecording()],['Export Chat','Save the current conversation as Markdown',()=>exportCurrentChat()],['Local Models','Open the local model manager',()=>show('local')],['Providers','Open provider settings',()=>show('settings')],['Terminal','Open the local terminal',()=>show('terminal')]];
+  for(const p of validProviders())items.push(['Use '+p.name,p.model||'Switch provider',()=>setProvider(p.id,{refresh:false})]);
+  for(const c of conversations.slice(0,40))items.push([(pinnedChats.has(c.id)?'★ ':'')+(c.title||'New Chat'),'Open saved chat',()=>loadChat(c.id)]);
+  return items.filter(x=>!query||x[0].toLowerCase().includes(query)||x[1].toLowerCase().includes(query));
+}
+function renderPalette(){const list=$('#paletteList'),q=$('#paletteInput').value.trim(),items=paletteItems(q);list.innerHTML=items.slice(0,30).map((x,i)=>'<button class="paletteItem" data-palette-index="'+i+'"><b>'+esc(x[0])+'</b><span>'+esc(x[1])+'</span></button>').join('')||'<div class="paletteEmpty">No matching action.</div>';list.querySelectorAll('[data-palette-index]').forEach(b=>b.onclick=()=>{const item=items[Number(b.dataset.paletteIndex)];closePalette();item?.[2]?.()})}
+function openPalette(){const m=$('#commandPalette');if(!m)return;m.classList.remove('hidden');$('#paletteInput').value='';renderPalette();$('#paletteInput').focus()}
+function closePalette(){$('#commandPalette')?.classList.add('hidden')}
