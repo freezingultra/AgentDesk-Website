@@ -26,7 +26,8 @@ async function loadSpeechModels(providerId){
 }
 function updateSpeechControls(p=current()){
   const stt=$('#sttModel'),record=$('#recordAudio'),tts=$('#ttsModel'),voice=$('#groqVoice'),sp=speechProvider();
-  if(stt)stt.classList.toggle('hidden',!sp);if(record)record.classList.toggle('hidden',!sp);
+  if(stt){stt.classList.remove('hidden');if(!sp)stt.innerHTML='<option value="">Groq · attach an API key for Voice to Text</option>'}
+  if(record){record.classList.remove('hidden');record.disabled=!sp;record.title=sp?'Voice to Text · Groq Whisper':'Add a Groq provider API key for Voice to Text'}
   const groq=!!p&&!!p.hasApiKey&&isGroqProviderClient(p);if(tts)tts.classList.toggle('hidden',!groq);if(voice)voice.classList.toggle('hidden',!groq);
   if(sp&&stt&&(!stt.dataset.provider||stt.dataset.provider!==sp.id)){stt.dataset.provider=sp.id;loadSpeechModels(sp.id)}
 }
