@@ -2,7 +2,7 @@
 #define AppVersion "38.0"
 #define AppPublisher "AgentDesk"
 #define AppExeName "AgentDesk.exe"
-#define AppSourceExe "..\release-assets\AgentDesk-v38.exe"
+#define AppSourceExe "..\release-assets\AgentDesk-v38.0.exe"
 
 [Setup]
 AppId={{D0B5F8C9-8C3A-4BE9-A0D2-1234567890AB}
