@@ -380,7 +380,7 @@ async function saveLocalSetup(){
 function renderLocalRecommendations(data){
   const rec=data.recommendations||[];
   const models=data.models||[];
-  $('#localInstalled').innerHTML=models.length?'<div class="localSubhead">Models already on this device</div>'+models.map(m=>'<button class="localModelRow" data-local-model="'+esc(m.id)+'"><b>'+esc(m.name)+'</b><span>'+esc(m.repoId||'')+'</span></button>').join(''):'<div class="muted">No local models detected yet.</div>';
+  $('#localInstalled').innerHTML=models.length?'<div class="localSubhead">Models already on this device</div>'+models.map(m=>'<button class="localModelRow" data-local-model="'+esc(m.id)+'"><b>'+esc(m.name)+'</b><span>'+esc(m.repoId||'')+'</span></button>').join(''):'<div class="muted">No runnable GGUF models detected yet. AgentDesk scans your Hugging Face cache, model folders and configured HF cache paths.</div>';
   $('#localRecommendations').innerHTML=rec.map(m=>'<div class="localRec"><div><b>'+esc(m.name)+'</b><span>'+esc(m.repoId)+' · '+esc(m.sizeHint)+'</span><small>'+esc(m.reason)+'</small></div><button data-local-install="'+esc(m.repoId)+'">Download</button></div>').join('');
   $('#localRecommendations').querySelectorAll('[data-local-install]').forEach(b=>b.onclick=()=>installLocalModelUI(b.dataset.localInstall));
   $('#localInstalled').querySelectorAll('[data-local-model]').forEach(b=>b.onclick=()=>{const id=b.dataset.localModel;const p=editableProviders().find(x=>x.id==='local:'+id);if(p){setProvider(p.id,{refresh:false});show('chat')}});
