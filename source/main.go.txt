@@ -33,7 +33,7 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-const appVersion = "38.0"
+const appVersion = "38.1"
 
 type Provider struct {
 	ID        string   `json:"id"`
@@ -2899,7 +2899,7 @@ func config(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "at least one provider is required", 400)
 		return
 	}
-	if err := saveConfig(Config{Providers: clean}); err != nil {
+	if err := saveConfig(Config{Providers: clean, Local: old.Local}); err != nil {
 		http.Error(w, "save failed: "+err.Error(), 500)
 		return
 	}
