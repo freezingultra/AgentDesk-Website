@@ -33,7 +33,7 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-const appVersion = "38.1"
+const appVersion = "38.2"
 
 type Provider struct {
 	ID        string   `json:"id"`
@@ -2250,6 +2250,7 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 	terminalAlways := strings.EqualFold(strings.TrimSpace(req.TerminalApprovalMode), "always")
 	codeAlways := false
 	pluginAlways := false
+	toolAlways := false
 	tools := agentToolsForProvider(p, true, shouldOfferWebTools(lastUser, req.Research))
 	webSearchCalls := 0
 	const maxRegularWebSearches = 5
@@ -2360,6 +2361,11 @@ func chatStream(w http.ResponseWriter, r *http.Request) {
 					if localErr!=nil { result=map[string]any{"ok":false,"error":localErr.Error()} } else { result=localResult }
 					if label!="" { send(map[string]any{"type":"tool","text":label}) }
 				} else {
+					if !toolAlways {
+						decision := requestPluginApproval(send,name,args)
+						if decision=="always" { toolAlways=true }
+						if decision=="no" { result=map[string]any{"ok":false,"error":"User denied agent tool execution."}; break }
+					}
 					localResult,label,localErr:=executeAgentLocalTool(name,args,req.AllowTerminal)
 					if localErr!=nil { result=map[string]any{"ok":false,"error":localErr.Error()} } else { result=localResult }
 					if label!="" { send(map[string]any{"type":"tool","text":label}) }
