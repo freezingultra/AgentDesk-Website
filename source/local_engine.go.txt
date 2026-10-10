@@ -443,7 +443,31 @@ func ensureLocalRuntime(m LocalModel) (string,error) {
 	_ = cmd.Process.Kill();return "",fmt.Errorf("local model server did not become ready")
 }
 
-func localModels() []LocalModel { return loadLocalSettings().Models }
+func refreshDetectedLocalModels() []LocalModel {
+	s := loadLocalSettings()
+	detected := detectExistingLocalModels()
+	changed := len(detected) != len(s.Models)
+	if !changed {
+		for i := range detected {
+			if i >= len(s.Models) || detected[i].ID != s.Models[i].ID || detected[i].Path != s.Models[i].Path {
+				changed = true
+				break
+			}
+		}
+	}
+	if changed {
+		s.Models = detected
+		if err := saveLocalSettings(s); err == nil {
+			for _, m := range detected {
+				upsertLocalProvider(m)
+			}
+		}
+		return detected
+	}
+	return s.Models
+}
+
+func localModels() []LocalModel { return refreshDetectedLocalModels() }
 
 func installLocalModel(rawURL string, token string) (LocalModel, bool, error) {
 	s:=loadLocalSettings();if strings.TrimSpace(token)!=""{s.HFToken=strings.TrimSpace(token)}
@@ -473,7 +497,7 @@ func upsertLocalProvider(m LocalModel) {
 func localProviderCleanup() {}
 
 func localHealth() map[string]any {
-	s:=loadLocalSettings();return map[string]any{"setupComplete":s.OnboardingComplete,"hardware":map[string]any{"nvidia":s.HasNvidiaGPU,"gpuName":s.GPUName,"vramGB":s.VRAMGB,"cpuCores":s.CPUCores,"cpuThreads":s.CPUThreads,"cpuTier":s.CPUTier,"ramGB":s.RAMGB,"ramSpeedMHz":s.RAMSpeedMHz},"models":s.Models,"recommendations":localRecommendations(s),"hfKeyAttached":strings.TrimSpace(s.HFToken)!=""}
+	s:=loadLocalSettings();s.Models=refreshDetectedLocalModels();return map[string]any{"setupComplete":s.OnboardingComplete,"hardware":map[string]any{"nvidia":s.HasNvidiaGPU,"gpuName":s.GPUName,"vramGB":s.VRAMGB,"cpuCores":s.CPUCores,"cpuThreads":s.CPUThreads,"cpuTier":s.CPUTier,"ramGB":s.RAMGB,"ramSpeedMHz":s.RAMSpeedMHz},"models":s.Models,"recommendations":localRecommendations(s),"hfKeyAttached":strings.TrimSpace(s.HFToken)!=""}
 }
 
 func localHFKey(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"method not allowed",405);return};var req struct{Token string `json:"token"`};if readJSON(r,&req)!=nil{http.Error(w,"invalid",400);return};s:=loadLocalSettings();s.HFToken=strings.TrimSpace(req.Token);if err:=saveLocalSettings(s);err!=nil{http.Error(w,err.Error(),500);return};jsonResp(w,map[string]any{"ok":true,"attached":s.HFToken!=""})}
