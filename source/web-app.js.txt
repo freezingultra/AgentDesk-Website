@@ -252,7 +252,13 @@ async function send(){
         }else if(ev.type==='error'){ hideThinking(thinking); throw new Error(ev.error); }
       }
     }
-    if(!out&&!bubble&&!controller.signal.aborted){hideThinking(thinking);throw new Error('The model finished without returning visible text. Check the model/provider response or try a different model.');}
+    if(!out&&!bubble&&!controller.signal.aborted){
+      hideThinking(thinking);
+      const fallback='The model completed its tool steps but did not return a final answer. The tool activity above shows what it checked. Ask me to summarize those results, or retry with a model that supports tool calling reliably.';
+      addMsg('AgentDesk',fallback);
+      state.messages.push({role:'assistant',content:fallback});
+      await persistChat();renderChats();hideActivity();return;
+    }
     hideThinking(thinking);
     hideActivity();
     state.messages.push({role:'assistant',content:out});
