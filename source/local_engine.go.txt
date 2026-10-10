@@ -123,9 +123,14 @@ func parseLocalProviderID(id string) bool { return strings.HasPrefix(strings.Tri
 
 func detectExistingLocalModels() []LocalModel {
  s:=loadLocalSettings()
- out:=append([]LocalModel(nil),s.Models...)
+ out:=make([]LocalModel,0,len(s.Models))
  seen:=map[string]bool{}
- for _,m:=range out{if strings.TrimSpace(m.Path)!=""{seen[m.Path]=true}}
+ for _,m:=range s.Models{
+  if strings.TrimSpace(m.Path)=="" { continue }
+  info,err:=os.Stat(m.Path)
+  if err!=nil||info.IsDir()||!strings.HasSuffix(strings.ToLower(m.Path),".gguf"){continue}
+  out=append(out,m);seen[m.Path]=true
+ }
  home,_:=os.UserHomeDir()
  roots:=[]string{
   filepath.Join(home,"Downloads"),
@@ -458,9 +463,16 @@ func refreshDetectedLocalModels() []LocalModel {
 	if changed {
 		s.Models = detected
 		if err := saveLocalSettings(s); err == nil {
-			for _, m := range detected {
-				upsertLocalProvider(m)
+			for _, m := range detected { upsertLocalProvider(m) }
+			keep := map[string]bool{}
+			for _, m := range detected { keep["local:"+m.ID] = true }
+			cfg := loadConfig()
+			providers := make([]Provider, 0, len(cfg.Providers))
+			for _, p := range cfg.Providers {
+				if strings.HasPrefix(p.ID, "local:") && !keep[p.ID] { continue }
+				providers = append(providers, p)
 			}
+			if len(providers) > 0 && len(providers) != len(cfg.Providers) { cfg.Providers = providers; _ = saveConfig(cfg) }
 		}
 		return detected
 	}
