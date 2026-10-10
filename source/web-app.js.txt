@@ -6,6 +6,9 @@ let pinnedChats=new Set();
 try{pinnedChats=new Set(JSON.parse(localStorage.getItem('agentdesk:pinnedChats')||'[]'))}catch{pinnedChats=new Set()}
 function savePinnedChats(){localStorage.setItem('agentdesk:pinnedChats',JSON.stringify([...pinnedChats]))}
 let terminalApprovalAlways=false;
+let activeChatAbortController=null;
+let activeChatRunning=false;
+function setChatRunning(running){activeChatRunning=running;const b=$('#send');if(!b)return;b.textContent=running?'■':'↑';b.title=running?'Stop response':'Send';b.classList.toggle('stopButton',running);b.setAttribute('aria-label',running?'Stop response':'Send');}
 const codePackages=new Map();let packageSeq=0;const modelRefreshInFlight=new Set();
 function isGroqProviderClient(p=current()){try{return !!p&&/api\.groq\.com$/i.test(new URL(normalizeBaseURL(p.baseUrl)).hostname)}catch{return false}}
 let mediaRecorder=null,mediaChunks=[],activeSpeechAudio=null,speechStopRequested=false;
@@ -171,6 +174,7 @@ function weatherish(t){return /\b(weather|forecast|temperature|rain|snow|humidit
 async function startResearchJob(query,p,geoLocation){const start=await api('/api/research/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:p.id,model:currentModel(),query,maxNewTok:Number(p.maxNewTok)||8192,location:geoLocation||null})});return pollResearchJob(start.id)}
 async function pollResearchJob(id,onProgress){let seen=0;for(;;){const j=await api('/api/research/status?id='+encodeURIComponent(id));const items=Array.isArray(j.progress)?j.progress:[];for(let i=seen;i<items.length;i++){if(onProgress)onProgress(items[i]);}seen=items.length;if(j.status==='done')return j;if(j.status==='error')throw new Error(j.error||'Research failed');await new Promise(r=>setTimeout(r,700))}}
 async function send(){
+  if(activeChatRunning){activeChatAbortController?.abort();return;}
   const promptEl=$('#prompt');
   const text=promptEl.value.trim();
   if(!text&&!state.attachments.length)return;
@@ -201,6 +205,7 @@ async function send(){
   addMsg('You',text||attachments.map(a=>a.name).join(', '),'',attachments);
   state.messages.push({role:'user',content});
 
+  const controller=new AbortController();activeChatAbortController=controller;setChatRunning(true);
   try{
     const geo=weatherish(text)?await getBrowserLocation():null;
     const research=$('#researchMode').checked;
@@ -208,6 +213,7 @@ async function send(){
     const r=await fetch('/api/chat/stream',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
+      signal:controller.signal,
       body:JSON.stringify({provider:p.id,model:currentModel(),messages:state.messages,maxNewTok:Number(p.maxNewTok)||4096,agent,research,allowTerminal:true,terminalApprovalMode:terminalApprovalAlways?'always':'ask',location:geo})
     });
     if(!r.ok)throw new Error(await r.text());
@@ -233,6 +239,7 @@ async function send(){
         else if(ev.type==='vision_encoder_offer'){ await requestVisionEncoderOffer(ev); }
         else if(ev.type==='terminal_approval'){ await requestTerminalApproval(ev); }
         else if(ev.type==='code_approval'){ await requestCodeApproval(ev); }
+        else if(ev.type==='plugin_approval'){ await requestPluginApproval(ev); }
         else if(ev.type==='chunk'){
           hideThinking(thinking);
           out+=ev.text;
@@ -245,7 +252,7 @@ async function send(){
         }else if(ev.type==='error'){ hideThinking(thinking); throw new Error(ev.error); }
       }
     }
-    if(!out&&!bubble){hideThinking(thinking);throw new Error('Model returned no text');}
+    if(!out&&!bubble&&!controller.signal.aborted){hideThinking(thinking);throw new Error('The model finished without returning visible text. Check the model/provider response or try a different model.');}
     hideThinking(thinking);
     hideActivity();
     state.messages.push({role:'assistant',content:out});
@@ -254,10 +261,9 @@ async function send(){
   }catch(e){
     document.querySelector('.thinkingMsg')?.remove();
     hideActivity();
-    addMsg('AgentDesk','Error: '+e.message);
-    state.messages.push({role:'assistant',content:'Error: '+e.message});
-    await persistChat();
-  }
+    if(controller.signal.aborted){addMsg('AgentDesk','Response stopped.');}
+    else {addMsg('AgentDesk','Error: '+e.message);state.messages.push({role:'assistant',content:'Error: '+e.message});await persistChat();}
+  }finally{if(activeChatAbortController===controller)activeChatAbortController=null;setChatRunning(false)}
 }
 async function persistChat(){const c=conversations.find(x=>x.id===state.chatId);if(!c)return;c.messages=state.messages;c.updated=new Date().toISOString();await saveConversation(c)}
 function attachmentRefs(c){if(!Array.isArray(c))return[];return c.filter(x=>x?.type==='file_ref'||x?.type==='image_ref').map(x=>x.type==='image_ref'?{kind:'image',name:x.image_ref?.name,mime:x.image_ref?.mime,path:x.image_ref?.path,size:x.image_ref?.size||0}:{kind:x.file_ref?.kind||'file',name:x.file_ref?.name,mime:x.file_ref?.mime,path:x.file_ref?.path,size:x.file_ref?.size||0})}
@@ -313,7 +319,42 @@ async function uploadFiles(files){
     }catch(e){addTool('File error: '+e.message)}
   }
 }
-function show(v){const target=$('#'+v+'View');if(!target)return;document.querySelectorAll('.view').forEach(x=>x.classList.add('hidden'));target.classList.remove('hidden');document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.view===v));$('#viewTitle').textContent=v==='settings'?'Providers':v==='research'?'Deep Research':v==='local'?'Local Models':v[0].toUpperCase()+v.slice(1);if(v==='settings'&&current()){loadProviderForm(current());renderProviderCards()}if(v==='terminal')loadTerminalInfo();if(v==='local')refreshLocalProviders()}
+async function requestPluginApproval(ev){
+  const modal=$('#pluginApprovalModal');if(!modal)return;
+  $('#pluginApprovalName').textContent=ev.plugin||'Plugin action';
+  $('#pluginApprovalArgs').textContent=ev.arguments||'{}';
+  modal.classList.remove('hidden');
+  return new Promise(resolve=>{
+    const finish=async decision=>{modal.classList.add('hidden');modal.querySelectorAll('[data-plugin-approval]').forEach(b=>b.onclick=null);try{await api('/api/plugin-approval',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ev.id,decision})})}catch{}resolve()};
+    modal.querySelectorAll('[data-plugin-approval]').forEach(b=>b.onclick=()=>finish(b.dataset.pluginApproval));
+  });
+}
+let plugins=[];
+async function loadPlugins(){
+  try{const r=await api('/api/plugins');plugins=Array.isArray(r.plugins)?r.plugins:[];renderPlugins()}catch(e){$('#pluginStatus')&&($('#pluginStatus').textContent='Plugin load failed: '+e.message)}
+}
+function renderPlugins(){
+  const el=$('#pluginList');if(!el)return;
+  if(!plugins.length){el.innerHTML='<div class="pluginEmpty">No plugins installed. Add an MCP server or make a custom HTTP plugin.</div>';return}
+  el.innerHTML=plugins.map(p=>'<div class="pluginCard"><div><b>'+esc(p.name)+'</b><span>'+esc(p.kind||'plugin')+' · '+(p.enabled?'Enabled':'Disabled')+'</span><small>'+esc(p.description||'')+'</small></div><div class="pluginCardActions"><button data-plugin-toggle="'+esc(p.id)+'">'+(p.enabled?'Disable':'Enable')+'</button><button data-plugin-delete="'+esc(p.id)+'">Delete</button></div></div>').join('');
+  el.querySelectorAll('[data-plugin-toggle]').forEach(b=>b.onclick=async()=>{const p=plugins.find(x=>x.id===b.dataset.pluginToggle);if(!p)return;p.enabled=!p.enabled;await savePluginObject(p)});
+  el.querySelectorAll('[data-plugin-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this plugin?'))return;await api('/api/plugins/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:b.dataset.pluginDelete})});loadPlugins()});
+}
+function pluginForm(){
+  const kind=$('#pluginKind').value,toolName=$('#pluginToolName').value.trim(),params=$('#pluginParameters').value.trim();
+  let parsed={type:'object',properties:{}};if(params){try{parsed=JSON.parse(params)}catch(e){throw new Error('Parameters JSON is invalid')}}
+  const p={id:$('#pluginId').value.trim()||$('#pluginName').value.trim(),name:$('#pluginName').value.trim(),description:$('#pluginDescription').value.trim(),kind,url:$('#pluginUrl').value.trim(),apiKey:$('#pluginApiKey').value.trim(),enabled:true,tools:[]};
+  if(kind==='http'){if(!toolName||!$('#pluginToolUrl').value.trim())throw new Error('Tool name and endpoint are required');p.tools=[{name:toolName,description:p.description||toolName,kind:'http',method:$('#pluginMethod').value,url:$('#pluginToolUrl').value.trim(),parameters:parsed,bodyTemplate:$('#pluginBody').value.trim(),requiresApproval:true}]}
+  return p;
+}
+async function savePluginObject(p){
+  try{await api('/api/plugins/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});$('#pluginStatus').textContent='Plugin saved. Enabled tools will appear to the agent immediately.';await loadPlugins()}catch(e){$('#pluginStatus').textContent='Plugin save failed: '+e.message}
+}
+async function savePluginUI(){try{const p=window._discoveredPlugin||pluginForm();await savePluginObject(p);window._discoveredPlugin=null}catch(e){$('#pluginStatus').textContent=e.message}}
+async function discoverPluginUI(){
+  try{const p=pluginForm();p.kind='mcp';const r=await api('/api/plugins/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const tools=Array.isArray(r.tools)?r.tools:[];p.tools=tools.map(t=>({...t,requiresApproval:true}));$('#pluginStatus').textContent='Discovered '+tools.length+' tool'+(tools.length===1?'':'s')+'. Click Save Plugin to install them.';window._discoveredPlugin=p}catch(e){$('#pluginStatus').textContent='Discovery failed: '+e.message}}
+async function testPluginUI(){try{const p=window._discoveredPlugin||pluginForm();await api('/api/plugins/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});$('#pluginStatus').textContent='Plugin connection looks good.'}catch(e){$('#pluginStatus').textContent='Plugin test failed: '+e.message}}
+function show(v){const target=$('#'+v+'View');if(!target)return;document.querySelectorAll('.view').forEach(x=>x.classList.add('hidden'));target.classList.remove('hidden');document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.view===v));$('#viewTitle').textContent=v==='settings'?'Providers':v==='research'?'Deep Research':v==='local'?'Local Models':v==='plugins'?'Plugins':v[0].toUpperCase()+v.slice(1);if(v==='settings'&&current()){loadProviderForm(current());renderProviderCards()}if(v==='terminal')loadTerminalInfo();if(v==='local')refreshLocalProviders();if(v==='plugins')loadPlugins()}
 function bindChips(){document.querySelectorAll('[data-fill]').forEach(b=>b.onclick=()=>{$('#prompt').value=b.dataset.fill;autoGrowPrompt();$('#prompt').focus()})}
 function renderMem(){const list=$('#memList');list.innerHTML=memories.map(m=>`<div class="mem"><div><div>${esc(m.text)}</div><div class="memMeta">${esc(m.kind)} · ${new Date(m.created).toLocaleString()}</div></div><button data-id="${esc(m.id)}">Delete</button></div>`).join('');list.querySelectorAll('[data-id]').forEach(b=>b.onclick=async()=>{await api('/api/memory?id='+encodeURIComponent(b.dataset.id),{method:'DELETE'});memories=await api('/api/memory');renderMem()})}
 const MEMORY_EXPORT_PROMPT=`Create a portable memory export about me from your saved memory/context.\n\nRules:\n- Do not include API keys, passwords, private credentials, security codes, or other secrets.\n- Include useful long-term preferences, projects, facts, recurring instructions, and context that would help another assistant respond consistently.\n- Do not include hidden chain-of-thought or private internal reasoning.\n- Return ONLY valid JSON in this exact shape:\n{"memories":[{"kind":"preference","text":"..."},{"kind":"project","text":"..."},{"kind":"fact","text":"..."}]}\n- Keep each memory concise and factual.`
@@ -427,8 +468,8 @@ function localPrivacyStep(h){
   $('#localFinish').onclick=saveLocalSetup;
 }
 function openLocalView(){show('local');refreshLocalProviders()}
-async function load(){config=await api('/api/config');config.providers=config.providers||[];memories=await api('/api/memory');conversations=await api('/api/conversations');const ps=validProviders();const first=ps[0];renderProviderSelects(first?.id||'');renderMem();renderChats();bindChips();setupPaste();if(first)setTimeout(()=>refreshProviderModels(first.id,true),100);await maybeShowLocalOnboarding()}
-document.addEventListener('DOMContentLoaded',()=>{try{$('#send').onclick=send;$('#recordAudio').onclick=toggleVoiceRecording;$('#ttsModel').onchange=updateTTSVoices;updateSpeechControls(current());$('#prompt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});$('#provider').onchange=()=>setProvider($('#provider').value,{refresh:true});$('#modelSelect').onchange=()=>{state.selectedModel=$('#modelSelect').value;updateTopMeta(current())};$('#settingsProviderSelect').onchange=()=>setProvider($('#settingsProviderSelect').value,{refresh:true});$('#newChat').onclick=resetChat;$('#closeChatSources').onclick=clearChatSources;document.addEventListener('click',e=>{const n=e.target.closest('.nav');if(n){e.preventDefault();show(n.dataset.view)}});$('#doSearch').onclick=search;$('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();search()}});$('#doResearch').onclick=deepResearch;$('#researchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();deepResearch()}});$('#addMem').onclick=async()=>{const t=$('#memInput').value.trim();if(!t)return;try{await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,kind:$('#memKind').value})});$('#memInput').value='';memories=await api('/api/memory');renderMem()}catch(e){$('#memoryImportStatus').textContent='Memory save failed: '+e.message}};$('#copyMemoryPrompt').onclick=async()=>{await navigator.clipboard.writeText(MEMORY_EXPORT_PROMPT);$('#memoryImportStatus').textContent='Memory export prompt copied.'};$('#importMemory').onclick=importMemory;$('#saveProvider').onclick=saveProvider;$('#newProvider').onclick=newProvider;$('#testProvider').onclick=testProvider;$('#discoverModels').onclick=discoverModels;$('#localDownloadButton').onclick=()=>installLocalModelUI($('#localModelUrl').value.trim());$('#attachHFKey').onclick=async()=>{const t=$('#hfToken').value.trim();if(!t)return;try{await api('/api/local/hf-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});hideLocalBanner();$('#localStatus').textContent='Hugging Face key attached locally.'}catch(e){showLocalBanner('Model Pull failed, Please attach a key')}};$('#addFile').onclick=()=>$('#fileInput').click();$('#fileInput').onchange=e=>uploadFiles(e.target.files);$('#closeRun').onclick=()=>$('#runModal').classList.add('hidden');$('#exportChat').onclick=exportCurrentChat;$('#openPalette').onclick=openPalette;$('#closePalette').onclick=closePalette;$('#paletteInput').addEventListener('input',renderPalette);$('#paletteInput').addEventListener('keydown',e=>{if(e.key==='Escape')closePalette();if(e.key==='Enter'){const first=$('#paletteList .paletteItem');if(first)first.click()}});document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()}else if(e.key==='Escape')closePalette()});$('#cancelRun').onclick=()=>$('#runModal').classList.add('hidden');$('#executeCode').onclick=executeCode;$('#runTerminal').onclick=runTerminal;$('#terminalUseHome').onclick=loadTerminalInfo;$('#terminalCommand').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();runTerminal()}});load().catch(e=>{const el=$('#testResult');if(el)el.textContent='Startup warning: '+e.message})}catch(e){console.error(e)}})
+async function load(){config=await api('/api/config');config.providers=config.providers||[];memories=await api('/api/memory');conversations=await api('/api/conversations');const ps=validProviders();const first=ps[0];renderProviderSelects(first?.id||'');renderMem();renderChats();bindChips();setupPaste();if(first)setTimeout(()=>refreshProviderModels(first.id,true),100);await maybeShowLocalOnboarding();await loadPlugins()}
+document.addEventListener('DOMContentLoaded',()=>{try{$('#send').onclick=send;$('#recordAudio').onclick=toggleVoiceRecording;$('#ttsModel').onchange=updateTTSVoices;updateSpeechControls(current());$('#prompt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});$('#provider').onchange=()=>setProvider($('#provider').value,{refresh:true});$('#modelSelect').onchange=()=>{state.selectedModel=$('#modelSelect').value;updateTopMeta(current())};$('#settingsProviderSelect').onchange=()=>setProvider($('#settingsProviderSelect').value,{refresh:true});$('#newChat').onclick=resetChat;$('#closeChatSources').onclick=clearChatSources;document.addEventListener('click',e=>{const n=e.target.closest('.nav');if(n){e.preventDefault();show(n.dataset.view)}});$('#doSearch').onclick=search;$('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();search()}});$('#doResearch').onclick=deepResearch;$('#researchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();deepResearch()}});$('#addMem').onclick=async()=>{const t=$('#memInput').value.trim();if(!t)return;try{await api('/api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,kind:$('#memKind').value})});$('#memInput').value='';memories=await api('/api/memory');renderMem()}catch(e){$('#memoryImportStatus').textContent='Memory save failed: '+e.message}};$('#copyMemoryPrompt').onclick=async()=>{await navigator.clipboard.writeText(MEMORY_EXPORT_PROMPT);$('#memoryImportStatus').textContent='Memory export prompt copied.'};$('#importMemory').onclick=importMemory;$('#saveProvider').onclick=saveProvider;$('#newProvider').onclick=newProvider;$('#testProvider').onclick=testProvider;$('#discoverModels').onclick=discoverModels;$('#localDownloadButton').onclick=()=>installLocalModelUI($('#localModelUrl').value.trim());$('#attachHFKey').onclick=async()=>{const t=$('#hfToken').value.trim();if(!t)return;try{await api('/api/local/hf-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});hideLocalBanner();$('#localStatus').textContent='Hugging Face key attached locally.'}catch(e){showLocalBanner('Model Pull failed, Please attach a key')}};$('#addFile').onclick=()=>$('#fileInput').click();$('#fileInput').onchange=e=>uploadFiles(e.target.files);$('#closeRun').onclick=()=>$('#runModal').classList.add('hidden');$('#exportChat').onclick=exportCurrentChat;$('#openPalette').onclick=openPalette;$('#closePalette').onclick=closePalette;$('#paletteInput').addEventListener('input',renderPalette);$('#paletteInput').addEventListener('keydown',e=>{if(e.key==='Escape')closePalette();if(e.key==='Enter'){const first=$('#paletteList .paletteItem');if(first)first.click()}});document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette()}else if(e.key==='Escape')closePalette()});$('#cancelRun').onclick=()=>$('#runModal').classList.add('hidden');$('#executeCode').onclick=executeCode;$('#pluginKind').onchange=()=>$('#pluginHttpFields').classList.toggle('hidden',$('#pluginKind').value!=='http');$('#pluginSave').onclick=savePluginUI;$('#pluginDiscover').onclick=discoverPluginUI;$('#pluginTest').onclick=testPluginUI;$('#runTerminal').onclick=runTerminal;$('#terminalUseHome').onclick=loadTerminalInfo;$('#terminalCommand').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();runTerminal()}});load().catch(e=>{const el=$('#testResult');if(el)el.textContent='Startup warning: '+e.message})}catch(e){console.error(e)}})
 function exportCurrentChat(){
   if(!state.messages.length){alert('There is no chat content to export yet.');return}
   const title=(conversations.find(x=>x.id===state.chatId)?.title||'AgentDesk Chat').trim(),lines=['# '+title,'','Exported from AgentDesk · '+new Date().toLocaleString(),''];
